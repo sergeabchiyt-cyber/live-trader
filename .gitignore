@@ -1,0 +1,25 @@
+# Rust build artifacts
+rust/target/
+target/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# data / outputs (regenerate — not committed)
+cache/
+*.log
+
+# env & secrets (never commit)
+.env
+.env.*
+*.pem
+*.key
+!**/.gitkeep
+
+# editor / OS
+.DS_Store
+.idea/
+.vscode/

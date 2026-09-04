@@ -1,0 +1,44 @@
+# Render blueprint for the FRVP PoC live trader (web service).
+#
+# Deploy: Render dashboard -> "New +" -> "Blueprint" -> pick this repo.
+# After the service is created, fill in the two secrets (BINANCE_API_KEY /
+# BINANCE_API_SECRET) in the Render dashboard Env tab, then Deploy.
+#
+# Market data always comes from the public data-api (no keys). Orders go to the
+# Binance SPOT TESTNET (testnet.binance.vision). PAXGUSDT is not listed on the
+# testnet, so SYMBOL here is BTCUSDT (a pair present on both the public feed and
+# the testnet). The strategy itself is symbol-agnostic (OHLCV + #trades).
+#
+# Do NOT set PORT: Render injects it and the app binds to it automatically.
+
+services:
+  - type: web
+    name: live-trader
+    runtime: python
+    plan: free
+    region: frankfurt  # choose a region whose IPs Binance does not geo-block
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 -m live.run
+    healthCheckPath: /api/state
+    autoDeploy: true
+    envVars:
+      - key: MODE
+        value: testnet
+      - key: BINANCE_TESTNET
+        value: "1"
+      - key: SYMBOL
+        value: BTCUSDT
+      - key: POSITION_USD
+        value: "20"
+      - key: BINANCE_DRY_RUN
+        value: "0"      # 0 = actually send orders to the testnet
+      - key: BINANCE_API_KEY
+        sync: false     # fill in Render dashboard (testnet key)
+      - key: BINANCE_API_SECRET
+        sync: false     # fill in Render dashboard (testnet secret)
+      - key: POLL_S
+        value: "5"
+      - key: SKIP_HOUR0
+        value: "1"
+      - key: RR
+        value: "2.0"
