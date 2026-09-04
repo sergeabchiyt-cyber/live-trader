@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 from config import load_config, print_banner
 from strategy import Strategy
-from datafeed import BinanceFeed, ReplayFeed
+from datafeed import BinanceFeed, BinanceWSFeed, HAVE_WS, ReplayFeed
 from broker import make_broker
 import server
 
@@ -36,9 +36,19 @@ def main():
         feed = ReplayFeed(csvp, speed=cfg.replay_speed, start=cfg.replay_start)
         mode_label = f"XAUUSD replay ({cfg.replay_speed:.1f}x, {feed.remaining()} bars left)"
     else:
-        feed = BinanceFeed(symbol=cfg.symbol)
-        feed.bootstrap()
-        mode_label = f"{cfg.symbol} live via Binance data-api (15m)"
+        use_ws = cfg.feed == "ws" and HAVE_WS
+        if use_ws:
+            feed = BinanceWSFeed(symbol=cfg.symbol)
+            feed.bootstrap()
+            feed.start()
+            mode_label = f"{cfg.symbol} live via Binance WS stream (15m, push)"
+        else:
+            feed = BinanceFeed(symbol=cfg.symbol)
+            feed.bootstrap()
+            mode_label = f"{cfg.symbol} live via Binance data-api (15m, poll)"
+            if cfg.feed == "ws":
+                print("[!] websocket-client not installed — FEED=rest fallback "
+                      "(pip install websocket-client for push)", flush=True)
 
     broker = make_broker(cfg)
 

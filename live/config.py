@@ -42,6 +42,7 @@ class Config:
     mode: str = "auto"                # auto|paper|testnet|live
     symbol: str = "PAXGUSDT"          # Binance spot symbol (PAXG = tokenized gold)
     data_source: str = "paxg"         # paxg (live Binance public) | xau (replay cache)
+    feed: str = "ws"                  # ws (WebSocket push) | rest (REST polling)
     rr: float = 2.0
     skip_hour0: bool = True           # no entries triggered 00:00-01:00 UTC
     trail_on: bool = True
@@ -103,6 +104,7 @@ def load_config(argv=None) -> Config:
         mode=e.get("MODE", "auto"),
         symbol=e.get("SYMBOL", "PAXGUSDT").upper(),
         data_source=e.get("DATA_SOURCE", "paxg").lower(),
+        feed=e.get("FEED", "ws").lower(),
         rr=float(e.get("RR", 2.0)),
         skip_hour0=_env_bool("SKIP_HOUR0", True),
         trail_on=_env_bool("TRAIL", True),

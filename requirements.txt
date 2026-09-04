@@ -1,3 +1,4 @@
-# No third-party runtime dependencies — the live server (run/strategy/datafeed/
-# broker/server) uses only the Python standard library. `pandas` is needed only
-# if you want to run the optional live/validate.py parity check locally.
+websocket-client>=1.6.0
+# The live server itself is pure stdlib except websocket-client, which powers
+# the default WebSocket (push) market-data feed. `pandas` is needed only for
+# the optional local parity check (live/validate.py).

@@ -5,7 +5,7 @@ languages that are **byte-for-byte engine-parity equivalent**:
 
 | Component | Language | What it is |
 |---|---|---|
-| `live/` | Python | Streaming strategy, data feed, broker layer (paper/testnet/live), HTTP+SSE dashboard, full-history parity check |
+| `live/` | Python | Streaming strategy, WebSocket data feed (push, no polling), broker layer (paper/testnet/live), HTTP+SSE dashboard, full-history parity check |
 | `rust/` | Rust | Same engine as a low-latency core — replay, benchmark and live feed loop (`frvp` binary) |
 
 The strategy: each session opens **22:00 UTC Sun–Thu**; the **previous session's volume
@@ -85,7 +85,8 @@ position/SL/TP/trail markers, trade log, equity curve and live events.
 **Data note:** the XAUUSD 15m replay dataset (`cache/XAUUSD_15m.csv`, 252,158 bars) is
 *not* committed to this repo — see `live/README.md` for the fetch/regen instructions,
 and `python3 live/validate.py` once you have it at `cache/XAUUSD_15m.csv`. PAXGUSDT live
-data needs no keys (Binance public `data-api.binance.vision`).
+data needs no keys — the feed is a **public WebSocket push**
+(`data-stream.binance.vision`; set `FEED=rest` to fall back to polling).
 
 Modes (env-driven): `paper` (default, exact-fill on live data) · `testnet` · `live`.
 Live/testnet are always dry-run unless you opt out — see the env table in `live/README.md`.

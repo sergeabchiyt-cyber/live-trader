@@ -1,16 +1,32 @@
 """Market data feeds -> closed 15M Bars.
 
-BinanceFeed : live PAXGUSDT (or any spot symbol) 15m klines from the PUBLIC
-              data-api endpoint (data-api.binance.vision — reachable without keys).
-              Tick proxy for the FRVP volume = per-kline 'number of trades'.
-ReplayFeed  : replays the backtest XAUUSD 15m CSV in (simulated) real time.
+BinanceWSFeed : PUSH feed. Bootstraps closed history once from the PUBLIC REST
+                data-api (data-api.binance.vision), then subscribes to the PUBLIC
+                WebSocket market-data stream (data-stream.binance.vision,
+                wss://data-stream.binance.vision/ws/<symbol>@kline_<interval>).
+                Only CLOSED klines (k.x == true) are forwarded as Bars; live
+                partial updates only refresh last_price. If the socket drops or
+                goes stale, poll() transparently backfills from REST so no closed
+                bar is ever missed. No API keys on any path.
+BinanceFeed   : legacy REST polling feed (same endpoint, no keys) — kept as a
+                fallback (FEED=rest).
+ReplayFeed    : replays the backtest XAUUSD 15m CSV in (simulated) real time.
+
+Tick proxy for the FRVP volume profile = per-kline 'number of trades' (k.n).
 """
-import time, json, threading
+import time, json, threading, collections
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from live.strategy import Bar, session_date
 
 PUBLIC = "https://data-api.binance.vision"
+STREAM = "wss://data-stream.binance.vision"
+
+try:
+    import websocket  # websocket-client
+    HAVE_WS = True
+except Exception:  # pragma: no cover - optional dependency
+    HAVE_WS = False
 
 
 def _get_json(url, timeout=15):
@@ -19,26 +35,34 @@ def _get_json(url, timeout=15):
         return json.loads(r.read().decode())
 
 
+def _interval_ms(interval):
+    unit = interval[-1]
+    n = int(interval[:-1])
+    return {"m": 60_000, "h": 3_600_000, "d": 86_400_000}[unit] * n
+
+
 class BinanceFeed:
+    """REST polling feed (public data-api, no keys). Used for WS bootstrap and
+    as a fallback when FEED=rest or the websocket-client lib is unavailable."""
+
     def __init__(self, symbol="PAXGUSDT", interval="15m", limit_boot=1000):
-        self.symbol = symbol
+        self.symbol = symbol.upper()
         self.interval = interval
-        self.unit_ms = 900_000
-        self._klines_url = (f"{PUBLIC}/api/v3/klines?symbol={symbol}&interval={interval}"
+        self.unit_ms = _interval_ms(interval)
+        self._klines_url = (f"{PUBLIC}/api/v3/klines?symbol={self.symbol}&interval={interval}"
                             f"&limit={limit_boot}")
-        self.ticker_url = f"{PUBLIC}/api/v3/ticker/price?symbol={symbol}"
+        self.ticker_url = f"{PUBLIC}/api/v3/ticker/price?symbol={self.symbol}"
         self.last = None
         self.last_price = None
         self.bars = []
 
-    # ---------- klines -> Bars (v = number of trades as tick proxy) ----------
     def _parse(self, k):
         out = []
         for row in k:
             if len(row) < 9:
                 continue
             ts = int(row[0]) // 1000
-            if ts <= (self.last or -1):
+            if ts <= (self.last if self.last is not None else -1):
                 continue
             b = Bar(ts, row[1], row[2], row[3], row[4], float(row[8]), t=float(row[8]))
             out.append(b)
@@ -50,6 +74,8 @@ class BinanceFeed:
         now = time.time() * 1000
         closed = [r for r in k if int(r[0]) + self.unit_ms <= now]
         self.bars = self._parse(closed)
+        if self.bars:
+            self.last = self.bars[-1].ts
         try:
             self.last_price = float(_get_json(self.ticker_url)["price"])
         except Exception:
@@ -61,7 +87,10 @@ class BinanceFeed:
         misses (limit small so cheap)."""
         n = max(2, min(20, len(self.bars) // 500 + 2))
         url = f"{PUBLIC}/api/v3/klines?symbol={self.symbol}&interval={self.interval}&limit={max(n,3)}"
-        k = _get_json(url)
+        try:
+            k = _get_json(url)
+        except Exception:
+            return [], self.last_price
         now = time.time() * 1000
         closed = [r for r in k if int(r[0]) + self.unit_ms <= now]
         newb = self._parse(closed)
@@ -72,6 +101,204 @@ class BinanceFeed:
             self.last_price = float(_get_json(self.ticker_url)["price"])
         except Exception:
             pass
+        return newb, self.last_price
+
+
+class BinanceWSFeed:
+    """PUSH market-data feed over the public Binance WebSocket.
+
+    Architecture (single strategy writer):
+      * bootstrap()   — one REST fetch of ~1000 closed klines (warm-up history).
+      * start()       — daemon thread subscribes to the kline stream and queues
+                        only CLOSED bars (k.x == true). Partial updates refresh
+                        last_price for the dashboard but never touch the engine.
+      * poll()        — drains queued closed bars (called from the main loop,
+                        which remains the ONLY caller of strategy.on_bar, so the
+                        engine has a single writer). If the socket is stale or
+                        down, poll() backfills the gap from REST automatically.
+
+    The stream auto-reconnects with backoff; websocket-client answers Binance
+    server pings and we also send our own keepalive pings.
+    """
+
+    def __init__(self, symbol="PAXGUSDT", interval="15m", limit_boot=1000,
+                 rest_fallback=True):
+        self.symbol = symbol.upper()
+        self.interval = interval
+        self.unit_ms = _interval_ms(interval)
+        self.url = f"{STREAM}/ws/{self.symbol.lower()}@kline_{interval}"
+        self._rest = BinanceFeed(self.symbol, interval, limit_boot)
+        self.rest_fallback = rest_fallback and HAVE_WS is False  # no WS lib at all
+        self.bars = []                       # warm-up history (bootstrap)
+        self.last_price = None
+        self._q = collections.deque()
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread = None
+        self._wsapp = None
+        self._connected = False
+        self._connect_fails = 0
+        self._last_msg = None                # time.time() of last WS message
+        self._last_emitted = None            # ts (s) of newest bar handed out
+        self._booted_at = time.time()
+
+    # ---------------- lifecycle ----------------
+    def bootstrap(self):
+        self.bars = self._rest.bootstrap()
+        if self.bars:
+            self._last_emitted = self.bars[-1].ts
+            self._rest.last = self._last_emitted
+        self.last_price = self._rest.last_price
+        return self.bars
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name=f"ws-{self.symbol}")
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        ws = self._wsapp
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
+        self._thread = None
+
+    def connected(self):
+        return self._connected
+
+    # ---------------- socket loop (daemon thread) ----------------
+    def _on_open(self, ws):
+        self._connected = True
+        self._connect_fails = 0
+        self._last_msg = time.time()
+        print(f"[ws-feed] {self.symbol} {self.interval} connected: {self.url}",
+              flush=True)
+
+    def _on_message(self, ws, message):
+        self._last_msg = time.time()
+        try:
+            m = json.loads(message)
+        except Exception:
+            return
+        if m.get("e") != "kline":
+            return
+        k = m.get("k") or {}
+        if not k:
+            return
+        try:
+            close_ = float(k["c"])
+        except Exception:
+            close_ = None
+        if close_ is not None:
+            self.last_price = close_
+        if not k.get("x"):
+            return                       # partial open-bar update
+        try:
+            b = Bar(int(k["t"]) // 1000,
+                    float(k["o"]), float(k["h"]), float(k["l"]), close_ or 0.0,
+                    float(k.get("n") or 0), t=float(k.get("n") or 0))
+        except Exception:
+            return
+        with self._lock:
+            self._q.append(b)
+
+    def _on_error(self, ws, error):
+        self._connected = False
+
+    def _on_close(self, ws, code, msg):
+        self._connected = False
+
+    def _run(self):
+        backoff = 1.0
+        while self._running:
+            if not HAVE_WS:
+                self._connected = False
+                return
+            try:
+                self._wsapp = websocket.WebSocketApp(
+                    self.url,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                # ping_interval keeps the connection alive; websocket-client also
+                # auto-answers Binance's server pings.
+                self._wsapp.run_forever(ping_interval=60, ping_timeout=15,
+                                        skip_utf8_validation=False)
+            except Exception:
+                pass
+            finally:
+                self._connected = False
+                self._wsapp = None
+            if not self._running:
+                return
+            self._connect_fails += 1
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 15.0)
+
+    # ---------------- main-thread consumption ----------------
+    def _rest_backfill(self):
+        """REST tail fetch used only when the stream is stale/down."""
+        newb, price = self._rest.poll()
+        if price is not None:
+            self.last_price = price
+        out = []
+        for b in newb:
+            if self._last_emitted is None or b.ts > self._last_emitted:
+                out.append(b)
+        return out
+
+    def poll(self):
+        """Drain closed bars received over WS since last call.
+
+        Returns (new_bars, last_price). When the socket is down or no message
+        has arrived for a while, transparently backfills from REST so the
+        strategy never misses a closed bar (acts as a slow poll fallback)."""
+        newb = []
+        with self._lock:
+            while self._q:
+                newb.append(self._q.popleft())
+        if newb:
+            newb.sort(key=lambda b: b.ts)
+            keep = []
+            for b in newb:
+                if self._last_emitted is None or b.ts > self._last_emitted:
+                    keep.append(b)
+            newb = keep
+            if newb:
+                self._last_emitted = newb[-1].ts
+                self.bars.extend(newb)
+        # stale / down? backfill from REST (only after an initial grace period)
+        stale = (self._last_msg is not None and
+                 time.time() - self._last_msg > 75.0) or \
+                (self._last_msg is None and time.time() - self._booted_at > 90.0)
+        if self.rest_fallback or (stale and time.time() - self._booted_at > 30.0):
+            try:
+                fill = self._rest_backfill()
+                if fill:
+                    if newb:
+                        print(f"[ws-feed] {self.symbol}: REST backfill "
+                              f"{len(fill)} closed bar(s) — stream stale/down",
+                              flush=True)
+                    else:
+                        print(f"[ws-feed] {self.symbol}: REST fallback "
+                              f"({len(fill)} bar(s)); socket "
+                              f"{'reconnecting' if HAVE_WS else 'disabled'}",
+                              flush=True)
+                    self._last_emitted = fill[-1].ts
+                    self.bars.extend(fill)
+                    newb.extend(fill)
+            except Exception:
+                pass
+        if newb:
+            newb.sort(key=lambda b: b.ts)
         return newb, self.last_price
 
 

@@ -28,8 +28,13 @@ Binance does not list physical XAUUSD; the best liquid tokenised-gold spot is
 **PAXG/USDT** (price tracks ~1 oz gold; ~$4,470 now). You can also point
 `SYMBOL=XAUTUSDT` at Tether Gold.
 
-* Market data always comes from **Binance public `data-api.binance.vision`**
-  (no keys needed; reachable from most regions incl. this sandbox).
+* Market data comes from **Binance public endpoints, no keys**:
+  **WebSocket push** by default (`wss://data-stream.binance.vision`,
+  `FEED=ws`) — closed 15m bars are forwarded the moment they finalise
+  (`k.x == true`), partial updates only refresh last price. A REST bootstrap
+  (1000 bars) warms the PD profile at start; if the socket drops or goes
+  stale the feed auto-backfills from `data-api.binance.vision` so no bar is
+  missed. Set `FEED=rest` to fall back to pure REST polling.
 * Spot order endpoints (`api.binance.com`, `testnet.binance.vision`) are
   **geo-blocked from this sandbox (HTTP 451)** — order code is included and
   works from your own machine; from here you run **paper** execution on live
@@ -65,12 +70,17 @@ overlay, position/SL/TP/trail markers, trade log, equity, live events).
 | `BINANCE_DRY_RUN` | `0` to actually place orders | `1` (safe) |
 | `SYMBOL` | `PAXGUSDT` (or `XAUTUSDT`) | `PAXGUSDT` |
 | `DATA_SOURCE` | `paxg` (live) \| `xau` (replay) | `paxg` |
+| `FEED` | `ws` (WebSocket push, default) \| `rest` (REST poll) | `ws` |
 | `RR` | reward:risk target | `2.0` |
 | `SKIP_HOUR0` | no entries 00:00–01:00 UTC | `1` |
 | `TRAIL` / `TRAIL_LADDER` | milestone trailing on/off & grid | on, `0.6:0.1,0.75:0.4,0.9:0.7` |
 | `SAME_BAR` | backtest-parity exits on the entry bar | `1` |
 | `POSITION_USD` | notional per trade (paper/live mirror) | `100` |
-| `PORT` / `POLL_S` | dashboard port / poll seconds | `8765` / `5` |
+| `PORT` / `POLL_S` | dashboard port / queue-drain seconds | `8765` / `5` |
+
+> `POLL_S` is now just how often the main loop drains the push queue and
+> republishes state (was the REST poll cadence). Bars arrive over WS at 15m
+> boundaries — latency ≈ one kline close, ~0 added polling delay.
 
 **Mode resolution (auto):** live if `BINANCE_API_KEY+SECRET` set and
 `BINANCE_LIVE_ACK=yes`; else testnet if `BINANCE_TESTNET=1` or testnet keys are
@@ -105,7 +115,7 @@ round-trip cost tolerance; PAXG spreads are small but not free).
 - `run.py`       main loop (feed → strategy → broker → dashboard)
 - `config.py`    env/CLI config & mode resolution
 - `strategy.py`  streaming engine, validated 1:1 vs `engine.py` (`live/validate.py`)
-- `datafeed.py`  BinanceFeed (public klines; v = #trades) & ReplayFeed (XAU CSV)
+- `datafeed.py`  BinanceWSFeed (push, auto-reconnect + REST backfill), BinanceFeed (REST poll) & ReplayFeed (XAU CSV)
 - `broker.py`    PaperBroker / BinanceBroker(testnet+live), auto dry-run
 - `server.py`    http/SSE endpoints; `dashboard_html.py` → UI
 - `validate.py`  full-history parity test vs backtest
