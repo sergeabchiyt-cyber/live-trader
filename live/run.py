@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(HERE))
 
 from config import load_config, print_banner
 from strategy import Strategy
-from datafeed import BinanceFeed, BinanceWSFeed, HAVE_WS, ReplayFeed
+from datafeed import BinanceFeed, BinanceWSFeed, BybitFeed, HAVE_WS, ReplayFeed
 from broker import make_broker
 import server
 
@@ -36,18 +36,30 @@ def main():
         feed = ReplayFeed(csvp, speed=cfg.replay_speed, start=cfg.replay_start)
         mode_label = f"XAUUSD replay ({cfg.replay_speed:.1f}x, {feed.remaining()} bars left)"
     else:
-        use_ws = cfg.feed == "ws" and HAVE_WS
-        if use_ws:
-            feed = BinanceWSFeed(symbol=cfg.symbol, venue=cfg.venue)
+        dv = cfg.resolved_data_venue
+        if dv == "bybit":
+            # Bybit v5 public REST (no keys). Push (FEED=ws) is not offered for
+            # Bybit: its CloudFront WS can reject datacenter handshakes, and a
+            # 5s REST poll is latency-equivalent for 15m bars.
+            if cfg.feed == "ws":
+                print("[i] DATA_VENUE=bybit uses the REST poll feed (POLL_S cadence)",
+                      flush=True)
+            feed = BybitFeed(symbol=cfg.symbol)
             feed.bootstrap()
-            feed.start()
-            mode_label = (f"{cfg.symbol} live via Binance {cfg.venue} WS stream "
-                          "(15m, push)")
+            mode_label = f"{cfg.symbol} live via Bybit public REST klines (15m, poll)"
         else:
-            feed = BinanceFeed(symbol=cfg.symbol, venue=cfg.venue)
-            feed.bootstrap()
-            mode_label = (f"{cfg.symbol} live via Binance {cfg.venue} REST klines "
-                          "(15m, poll)")
+            use_ws = cfg.feed == "ws" and HAVE_WS
+            if use_ws:
+                feed = BinanceWSFeed(symbol=cfg.symbol, venue=dv)
+                feed.bootstrap()
+                feed.start()
+                mode_label = (f"{cfg.symbol} live via Binance {dv} WS stream "
+                              "(15m, push)")
+            else:
+                feed = BinanceFeed(symbol=cfg.symbol, venue=dv)
+                feed.bootstrap()
+                mode_label = (f"{cfg.symbol} live via Binance {dv} REST klines "
+                              "(15m, poll)")
             if cfg.feed == "ws":
                 print("[!] websocket-client not installed — FEED=rest fallback "
                       "(pip install websocket-client for push)", flush=True)

@@ -40,8 +40,8 @@ def _parse_ladder(s):
 @dataclass
 class Config:
     mode: str = "auto"                # auto|paper|testnet|live
-    venue: str = "spot"               # spot (data-api.binance.vision, SPOT orders) |
-                                      # futures (fapi/fstream.binance.com, USDT-M perp orders)
+    venue: str = "spot"               # ORDER venue: spot (SPOT orders) | futures (USDT-M perp orders)
+    data_venue: str = "auto"          # DATA venue: auto (follow VENUE) | spot | futures | bybit
     symbol: str = "PAXGUSDT"          # Binance symbol (PAXG = tokenized gold; XAUUSDT = gold TRADFI perp, futures only)
     data_source: str = "paxg"         # paxg (live Binance public) | xau (replay cache)
     feed: str = "ws"                  # ws (WebSocket push) | rest (REST polling)
@@ -99,12 +99,21 @@ class Config:
         """Orders actually reach a real exchange."""
         return self.resolved_mode in ("live", "testnet") and not self.dry_run
 
+    @property
+    def resolved_data_venue(self) -> str:
+        """Which market-data source feeds the strategy."""
+        dv = self.data_venue
+        if dv in ("spot", "futures", "bybit"):
+            return dv
+        return self.venue if self.venue in ("spot", "futures") else "spot"
+
 
 def load_config(argv=None) -> Config:
     e = os.environ
     c = Config(
         mode=e.get("MODE", "auto"),
         venue=e.get("VENUE", "spot").lower(),
+        data_venue=e.get("DATA_VENUE", "auto").lower(),
         symbol=e.get("SYMBOL", "PAXGUSDT").upper(),
         data_source=e.get("DATA_SOURCE", "paxg").lower(),
         feed=e.get("FEED", "ws").lower(),
@@ -170,13 +179,14 @@ def print_banner(c: Config):
     print("=" * 68)
     print(f"  {icon} FRVP PoC live trader   mode = {mode.upper()}"
           f"{'  (dry-run, no real orders)' if c.dry_run and mode != 'paper' else ''}")
-    src = "REPLAY-XAU" if c.data_source == "xau" else "LIVE-BINANCE"
-    print(f"     data      : {src}  symbol={c.symbol}  venue={c.venue}"
+    src = "REPLAY-XAU" if c.data_source == "xau" else (
+        "LIVE-BYBIT" if c.resolved_data_venue == "bybit" else "LIVE-BINANCE")
+    print(f"     data      : {src}  symbol={c.symbol}  orders-venue={c.venue}"
           + (f"  csv={c.xau_csv}" if c.data_source == "xau" else ""))
     if c.data_source == "paxg":
-        md = ("Binance spot public data (data-api/data-stream.binance.vision)"
-              if c.venue == "spot" else
-              "Binance USDT-M perp public data (fapi/fstream.binance.com)")
+        md = { "spot": "Binance spot public data (data-api/data-stream.binance.vision)",
+               "futures": "Binance USDT-M perp public data (fapi/fstream.binance.com)",
+               "bybit": "Bybit public market data (api.bybit.com, REST poll)" }[c.resolved_data_venue]
         print(f"     market    : {md} (no keys)")
     else:
         print(f"     market    : XAUUSD replay cache")

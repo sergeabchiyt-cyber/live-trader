@@ -68,8 +68,9 @@ overlay, position/SL/TP/trail markers, trade log, equity, live events).
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | testnet **or** live keys | – |
 | `BINANCE_LIVE_ACK` | must equal `yes` to enable live (safety) | – |
 | `BINANCE_DRY_RUN` | `0` to actually place orders | `1` (safe) |
-| `VENUE` | `spot` (data-api + SPOT orders) \| `futures` (fapi/fstream + USDT-M perp orders) | `spot` |
-| `SYMBOL` | spot: `PAXGUSDT` (or `XAUTUSDT`) · futures: `XAUUSDT` (gold TRADFI perp) | `PAXGUSDT` |
+| `VENUE` | ORDER routing: `spot` (SPOT) \| `futures` (USDT-M perp) | `spot` |
+| `DATA_VENUE` | market data: `auto` (follow VENUE) \| `spot` \| `futures` \| `bybit` | `auto` |
+| `SYMBOL` | spot: `PAXGUSDT`/`XAUTUSDT` · futures: `XAUUSDT` (gold TRADFI perp) · bybit: `XAUUSDT` (gold perp) | `PAXGUSDT` |
 | `DATA_SOURCE` | `paxg` (live) \| `xau` (replay) | `paxg` |
 | `FEED` | `ws` (WebSocket push, default) \| `rest` (REST poll) | `ws` |
 | `RR` | reward:risk target | `2.0` |
@@ -83,12 +84,19 @@ overlay, position/SL/TP/trail markers, trade log, equity, live events).
 > republishes state (was the REST poll cadence). Bars arrive over WS at 15m
 > boundaries — latency ≈ one kline close, ~0 added polling delay.
 
-**Futures venue (`VENUE=futures`):** market data comes from the public USDT-M
-fapi/fstream endpoints (no keys); orders route to the USDT-M **futures testnet**
+**Futures venue (`VENUE=futures`):** orders route to the USDT-M **futures testnet**
 (`testnet.binancefuture.com` — keys are separate from the spot testnet) or
 `fapi.binance.com` live, using LIMIT entries + reduceOnly `STOP_MARKET` SL /
 `TAKE_PROFIT_MARKET` TP, leverage pinned to 1. `XAUUSDT` (gold TRADFI perp)
 only exists on this venue; on spot use `PAXGUSDT`.
+
+**Bybit data (`DATA_VENUE=bybit`):** Binance blocks datacenter IPs (HTTP 418)
+from its *mainnet* futures endpoints — including every Render region — so on
+cloud hosts the strategy can be fed from **Bybit's public v5 REST API**
+(`api.bybit.com`, no keys, `POLL_S` poll) instead: real XAUUSDT gold-perp
+prices and volume (profile weighted by traded volume rather than per-bar trade
+count). Combine e.g. `DATA_VENUE=bybit SYMBOL=XAUUSDT` (data) with
+`VENUE=futures MODE=testnet` (orders → Binance futures testnet).
 
 **Mode resolution (auto):** live if `BINANCE_API_KEY+SECRET` set and
 `BINANCE_LIVE_ACK=yes`; else testnet if `BINANCE_TESTNET=1` or testnet keys are

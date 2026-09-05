@@ -4,12 +4,18 @@
 # After the service is created, fill in the two secrets (BINANCE_API_KEY /
 # BINANCE_API_SECRET) in the Render dashboard Env tab, then Deploy.
 #
-# VENUE=futures: market data = XAUUSDT TRADFI gold perpetual from the PUBLIC
-# USDT-M futures endpoints (fapi/fstream.binance.com, no keys). Orders go to
-# the Binance USDT-M FUTURES TESTNET (testnet.binancefuture.com) — its keys are
-# SEPARATE from the spot testnet (get them at https://testnet.binancefuture.com).
-# XAUUSDT does not exist on Binance spot; on spot use SYMBOL=PAXGUSDT.
-# The strategy itself is symbol/venue-agnostic (OHLCV + #trades).
+# Architecture on Render (Binance blocks datacenter IPs — HTTP 418 — from its
+# MAINNET futures endpoints; spot *.binance.vision public data is exempt):
+#   * MARKET DATA  (DATA_VENUE=bybit): real XAUUSDT gold-perp klines from
+#     Bybit's public v5 REST API (api.bybit.com, no keys, poll every POLL_S).
+#     Volume profile weighted by real traded volume.
+#   * ORDERS (VENUE=futures, MODE=testnet): Binance USDT-M FUTURES TESTNET
+#     (testnet.binancefuture.com — keys SEPARATE from the spot testnet, get
+#     them at https://testnet.binancefuture.com): LIMIT entries, reduceOnly
+#     STOP_MARKET SL + TAKE_PROFIT_MARKET TP, leverage 1x.
+#   * Alternatives: DATA_VENUE=futures (Binance futures testnet data — synthetic
+#     volume) or DATA_VENUE=spot SYMBOL=PAXGUSDT (tokenized gold, real spot
+#     data via data-api.binance.vision; spot testnet can't trade it).
 #
 # Do NOT set PORT: Render injects it and the app binds to it automatically.
 
@@ -18,7 +24,7 @@ services:
     name: live-trader
     runtime: python
     plan: free
-    region: frankfurt  # choose a region whose IPs Binance does not geo-block
+    region: frankfurt  # choose a region whose IPs Binance/Bybit do not geo-block
     buildCommand: pip install -r requirements.txt
     startCommand: python3 -m live.run
     healthCheckPath: /api/state
@@ -28,12 +34,14 @@ services:
       - key: PYTHONUNBUFFERED
         value: "1"          # live logs on Render (no stdout buffering)
       - key: FEED
-        value: ws           # ws (default, push) | rest (polling fallback)
+        value: rest         # bybit data venue is REST-poll by design
       - key: POLL_S
         value: "5"
-      # venue + mode + order routing (USDT-M futures testnet)
+      # data venue + mode + order routing
+      - key: DATA_VENUE
+        value: bybit        # bybit (real XAUUSDT perp data) | spot | futures
       - key: VENUE
-        value: futures      # futures (XAUUSDT perp) | spot (PAXGUSDT)
+        value: futures      # order routing: futures (USDT-M perp) | spot
       - key: MODE
         value: testnet
       - key: BINANCE_TESTNET
@@ -46,7 +54,7 @@ services:
         sync: false         # fill in Render dashboard (FUTURES testnet secret)
       # strategy / instrument
       - key: SYMBOL
-        value: XAUUSDT      # gold TRADFI perp (USDT-M); lot precision 0.001
+        value: XAUUSDT      # gold perp (data: Bybit; orders: Binance f-testnet)
       - key: POSITION_USD
         value: "20"
       - key: RR

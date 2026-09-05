@@ -12,6 +12,9 @@ BinanceWSFeed : PUSH feed. Bootstraps closed history once from the PUBLIC REST
                 bar is ever missed. No API keys on any path.
 BinanceFeed   : legacy REST polling feed (same endpoints, no keys) — kept as a
                 fallback (FEED=rest).
+BybitFeed     : REST polling feed for Bybit USDT linear perps (XAUUSDT gold
+                perp) — public, no keys. DATA_VENUE=bybit (useful where Binance
+                blocks datacenter IPs from mainnet futures).
 ReplayFeed    : replays the backtest XAUUSD 15m CSV in (simulated) real time.
 
 Tick proxy for the FRVP volume profile = per-kline 'number of trades' (k.n).
@@ -25,6 +28,7 @@ PUBLIC = "https://data-api.binance.vision"       # spot public market data (no k
 STREAM = "wss://data-stream.binance.vision"       # spot public WS
 FAPI = "https://fapi.binance.com"                 # USDT-M futures public market data (no keys for md)
 FSTREAM = "wss://fstream.binance.com"             # USDT-M futures public WS
+BYBIT = "https://api.bybit.com"                   # Bybit v5 public market data (no keys)
 
 # per-venue endpoints (klines rows & kline WS payloads are format-identical)
 VENUES = {
@@ -335,6 +339,98 @@ class BinanceWSFeed:
                 pass
         if newb:
             newb.sort(key=lambda b: b.ts)
+        return newb, self.last_price
+
+
+class BybitFeed:
+    """REST polling feed for Bybit USDT linear perpetuals (e.g. XAUUSDT gold
+    perp) — public, no keys. Used when DATA_VENUE=bybit: Binance blocks
+    datacenter IPs from mainnet futures (418), and Bybit's CloudFront WS can
+    reject datacenter handshakes, so this is a plain REST poll (POLL_S cadence;
+    for a 15m bar strategy a 5s poll is latency-equivalent to a push stream).
+
+    Bybit v5 kline rows: [startMs, open, high, low, close, volume, turnover],
+    NEWEST-first; only start+interval <= now rows are closed. The strategy
+    weights the volume profile by b.v, so Bybit base volume maps to v (real
+    traded volume — Binance feeds use per-bar trade count there instead).
+    """
+
+    _IV = {"1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
+           "1h": "60", "2h": "120", "4h": "240", "1d": "D"}
+
+    def __init__(self, symbol="XAUUSDT", interval="15m", limit_boot=1000):
+        self.symbol = symbol.upper()
+        self.interval = interval
+        self.unit_ms = _interval_ms(interval)
+        self._iv = self._IV.get(interval, "15")
+        self._klines_url = (f"{BYBIT}/v5/market/kline?category=linear"
+                            f"&symbol={self.symbol}&interval={self._iv}"
+                            f"&limit={min(limit_boot, 1000)}")
+        self.ticker_url = (f"{BYBIT}/v5/market/tickers?category=linear"
+                           f"&symbol={self.symbol}")
+        self.last = None
+        self.last_price = None
+        self.bars = []
+
+    @staticmethod
+    def _klines(j):
+        if j.get("retCode") not in (0, None):
+            raise ValueError(f"bybit retCode {j.get('retCode')}: {j.get('retMsg')}")
+        return list(reversed(j.get("result", {}).get("list", [])))  # -> oldest-first
+
+    def _parse(self, k):
+        out = []
+        for row in k:
+            if len(row) < 7:
+                continue
+            ts = int(row[0]) // 1000
+            if ts <= (self.last if self.last is not None else -1):
+                continue
+            vol = float(row[5])
+            out.append(Bar(ts, row[1], row[2], row[3], row[4], vol, t=vol))
+        return out
+
+    def _ticker(self):
+        j = _get_json(self.ticker_url)
+        if j.get("retCode") not in (0, None):
+            return
+        lst = j.get("result", {}).get("list") or []
+        if lst:
+            self.last_price = float(lst[0]["lastPrice"])
+
+    def bootstrap(self):
+        """Initial snapshot of closed bars (retries on transient failures)."""
+        rows = self._klines(_get_json(self._klines_url, retries=6))
+        now = time.time() * 1000
+        closed = [r for r in rows if int(r[0]) + self.unit_ms <= now]
+        self.bars = self._parse(closed)
+        if self.bars:
+            self.last = self.bars[-1].ts
+        try:
+            self._ticker()
+        except Exception:
+            pass
+        return self.bars
+
+    def poll(self):
+        """Return (new_bars, last_price); tolerant of misses."""
+        n = max(3, min(20, len(self.bars) // 500 + 3))
+        url = (f"{BYBIT}/v5/market/kline?category=linear&symbol={self.symbol}"
+               f"&interval={self._iv}&limit={n}")
+        try:
+            rows = self._klines(_get_json(url))
+        except Exception:
+            return [], self.last_price
+        now = time.time() * 1000
+        closed = [r for r in rows if int(r[0]) + self.unit_ms <= now]
+        newb = self._parse(closed)
+        if newb:
+            self.bars.extend(newb)
+            self.last = self.bars[-1].ts
+        try:
+            self._ticker()
+        except Exception:
+            pass
         return newb, self.last_price
 
 
