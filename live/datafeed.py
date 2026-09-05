@@ -1,14 +1,16 @@
 """Market data feeds -> closed 15M Bars.
 
 BinanceWSFeed : PUSH feed. Bootstraps closed history once from the PUBLIC REST
-                data-api (data-api.binance.vision), then subscribes to the PUBLIC
-                WebSocket market-data stream (data-stream.binance.vision,
-                wss://data-stream.binance.vision/ws/<symbol>@kline_<interval>).
+                data-api, then subscribes to the PUBLIC WebSocket market-data
+                stream (wss://.../ws/<symbol>@kline_<interval>).
+                venue="spot"   -> data-api/data-stream.binance.vision (SPOT)
+                venue="futures"-> fapi.binance.com / fstream.binance.com (USDT-M
+                                  perpetuals incl. XAUUSDT gold TRADFI perp)
                 Only CLOSED klines (k.x == true) are forwarded as Bars; live
                 partial updates only refresh last_price. If the socket drops or
                 goes stale, poll() transparently backfills from REST so no closed
                 bar is ever missed. No API keys on any path.
-BinanceFeed   : legacy REST polling feed (same endpoint, no keys) — kept as a
+BinanceFeed   : legacy REST polling feed (same endpoints, no keys) — kept as a
                 fallback (FEED=rest).
 ReplayFeed    : replays the backtest XAUUSD 15m CSV in (simulated) real time.
 
@@ -19,8 +21,22 @@ import urllib.request
 from datetime import datetime, timezone, timedelta
 from live.strategy import Bar, session_date
 
-PUBLIC = "https://data-api.binance.vision"
-STREAM = "wss://data-stream.binance.vision"
+PUBLIC = "https://data-api.binance.vision"       # spot public market data (no keys)
+STREAM = "wss://data-stream.binance.vision"       # spot public WS
+FAPI = "https://fapi.binance.com"                 # USDT-M futures public market data (no keys for md)
+FSTREAM = "wss://fstream.binance.com"             # USDT-M futures public WS
+
+# per-venue endpoints (klines rows & kline WS payloads are format-identical)
+VENUES = {
+    "spot": dict(
+        rest=PUBLIC, stream=STREAM,
+        klines="/api/v3/klines", ticker="/api/v3/ticker/price",
+    ),
+    "futures": dict(
+        rest=FAPI, stream=FSTREAM,
+        klines="/fapi/v1/klines", ticker="/fapi/v1/ticker/price",
+    ),
+}
 
 try:
     import websocket  # websocket-client
@@ -29,10 +45,20 @@ except Exception:  # pragma: no cover - optional dependency
     HAVE_WS = False
 
 
-def _get_json(url, timeout=15):
-    req = urllib.request.Request(url, headers={"User-Agent": "frvp-trader/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+def _get_json(url, timeout=15, retries=1, backoff=2.0):
+    """GET url -> parsed JSON. retries>1 adds linear backoff (boot resilience
+    against transient geo-edge 451s / network hiccups)."""
+    last = None
+    for i in range(max(1, retries)):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "frvp-trader/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode())
+        except Exception as ex:
+            last = ex
+            if i + 1 < max(1, retries):
+                time.sleep(backoff * (i + 1))
+    raise last
 
 
 def _interval_ms(interval):
@@ -45,13 +71,18 @@ class BinanceFeed:
     """REST polling feed (public data-api, no keys). Used for WS bootstrap and
     as a fallback when FEED=rest or the websocket-client lib is unavailable."""
 
-    def __init__(self, symbol="PAXGUSDT", interval="15m", limit_boot=1000):
+    def __init__(self, symbol="PAXGUSDT", interval="15m", limit_boot=1000,
+                 venue="spot"):
         self.symbol = symbol.upper()
         self.interval = interval
+        self.venue = venue if venue in VENUES else "spot"
+        v = VENUES[self.venue]
         self.unit_ms = _interval_ms(interval)
-        self._klines_url = (f"{PUBLIC}/api/v3/klines?symbol={self.symbol}&interval={interval}"
-                            f"&limit={limit_boot}")
-        self.ticker_url = f"{PUBLIC}/api/v3/ticker/price?symbol={self.symbol}"
+        self._base = v["rest"]
+        self._klines_path = v["klines"]
+        self._klines_url = (f"{self._base}{v['klines']}?symbol={self.symbol}"
+                            f"&interval={interval}&limit={limit_boot}")
+        self.ticker_url = f"{self._base}{v['ticker']}?symbol={self.symbol}"
         self.last = None
         self.last_price = None
         self.bars = []
@@ -69,8 +100,9 @@ class BinanceFeed:
         return out
 
     def bootstrap(self):
-        """Initial snapshot of closed bars (fetches once)."""
-        k = _get_json(self._klines_url)
+        """Initial snapshot of closed bars (fetches once, with retries — a
+        transient failure here would otherwise kill the whole process)."""
+        k = _get_json(self._klines_url, retries=6)
         now = time.time() * 1000
         closed = [r for r in k if int(r[0]) + self.unit_ms <= now]
         self.bars = self._parse(closed)
@@ -86,7 +118,8 @@ class BinanceFeed:
         """Return (new_bars, last_price). Fetches the tail of klines; robust to
         misses (limit small so cheap)."""
         n = max(2, min(20, len(self.bars) // 500 + 2))
-        url = f"{PUBLIC}/api/v3/klines?symbol={self.symbol}&interval={self.interval}&limit={max(n,3)}"
+        url = (f"{self._base}{self._klines_path}?symbol={self.symbol}"
+               f"&interval={self.interval}&limit={max(n,3)}")
         try:
             k = _get_json(url)
         except Exception:
@@ -122,12 +155,15 @@ class BinanceWSFeed:
     """
 
     def __init__(self, symbol="PAXGUSDT", interval="15m", limit_boot=1000,
-                 rest_fallback=True):
+                 rest_fallback=True, venue="spot"):
         self.symbol = symbol.upper()
         self.interval = interval
+        self.venue = venue if venue in VENUES else "spot"
         self.unit_ms = _interval_ms(interval)
-        self.url = f"{STREAM}/ws/{self.symbol.lower()}@kline_{interval}"
-        self._rest = BinanceFeed(self.symbol, interval, limit_boot)
+        self.url = (f"{VENUES[self.venue]['stream']}/ws/"
+                    f"{self.symbol.lower()}@kline_{interval}")
+        self._rest = BinanceFeed(self.symbol, interval, limit_boot,
+                                 venue=self.venue)
         self.rest_fallback = rest_fallback and HAVE_WS is False  # no WS lib at all
         self.bars = []                       # warm-up history (bootstrap)
         self.last_price = None

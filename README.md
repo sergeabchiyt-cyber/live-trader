@@ -84,9 +84,11 @@ position/SL/TP/trail markers, trade log, equity curve and live events.
 
 **Data note:** the XAUUSD 15m replay dataset (`cache/XAUUSD_15m.csv`, 252,158 bars) is
 *not* committed to this repo — see `live/README.md` for the fetch/regen instructions,
-and `python3 live/validate.py` once you have it at `cache/XAUUSD_15m.csv`. PAXGUSDT live
-data needs no keys — the feed is a **public WebSocket push**
-(`data-stream.binance.vision`; set `FEED=rest` to fall back to polling).
+and `python3 live/validate.py` once you have it at `cache/XAUUSD_15m.csv`. Live data
+needs no keys — the feed is a **public WebSocket push**
+(`data-stream.binance.vision` for spot, `fstream.binance.com` for USDT-M perps;
+set `FEED=rest` to fall back to polling). `VENUE=futures SYMBOL=XAUUSDT` runs the
+strategy on the gold TRADFI perpetual (orders → USDT-M futures testnet).
 
 Modes (env-driven): `paper` (default, exact-fill on live data) · `testnet` · `live`.
 Live/testnet are always dry-run unless you opt out — see the env table in `live/README.md`.

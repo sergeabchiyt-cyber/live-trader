@@ -40,7 +40,9 @@ def _parse_ladder(s):
 @dataclass
 class Config:
     mode: str = "auto"                # auto|paper|testnet|live
-    symbol: str = "PAXGUSDT"          # Binance spot symbol (PAXG = tokenized gold)
+    venue: str = "spot"               # spot (data-api.binance.vision, SPOT orders) |
+                                      # futures (fapi/fstream.binance.com, USDT-M perp orders)
+    symbol: str = "PAXGUSDT"          # Binance symbol (PAXG = tokenized gold; XAUUSDT = gold TRADFI perp, futures only)
     data_source: str = "paxg"         # paxg (live Binance public) | xau (replay cache)
     feed: str = "ws"                  # ws (WebSocket push) | rest (REST polling)
     rr: float = 2.0
@@ -102,6 +104,7 @@ def load_config(argv=None) -> Config:
     e = os.environ
     c = Config(
         mode=e.get("MODE", "auto"),
+        venue=e.get("VENUE", "spot").lower(),
         symbol=e.get("SYMBOL", "PAXGUSDT").upper(),
         data_source=e.get("DATA_SOURCE", "paxg").lower(),
         feed=e.get("FEED", "ws").lower(),
@@ -167,18 +170,27 @@ def print_banner(c: Config):
     print("=" * 68)
     print(f"  {icon} FRVP PoC live trader   mode = {mode.upper()}"
           f"{'  (dry-run, no real orders)' if c.dry_run and mode != 'paper' else ''}")
-    print(f"     data      : {c.data_source.upper()}  symbol={c.symbol}"
-          + ("" if c.data_source != "xau" else f"  csv={c.xau_csv}"))
-    print(f"     market    : data-api.binance.vision (public) "
-          if c.data_source == "paxg" else "     market    : XAUUSD replay cache")
+    src = "REPLAY-XAU" if c.data_source == "xau" else "LIVE-BINANCE"
+    print(f"     data      : {src}  symbol={c.symbol}  venue={c.venue}"
+          + (f"  csv={c.xau_csv}" if c.data_source == "xau" else ""))
+    if c.data_source == "paxg":
+        md = ("Binance spot public data (data-api/data-stream.binance.vision)"
+              if c.venue == "spot" else
+              "Binance USDT-M perp public data (fapi/fstream.binance.com)")
+        print(f"     market    : {md} (no keys)")
+    else:
+        print(f"     market    : XAUUSD replay cache")
     print(f"     settings  : RR={c.rr:g}  skip-00:01={c.skip_hour0}  trail={c.trail_on}"
           + (f" {[(p, a) for p, a in c.trail_ladder]}" if c.trail_on else ""))
     print(f"     position  : {c.position_usd:g} USDT notional   poll={c.poll_s}s   "
           f"http://{c.host}:{c.port}")
     if mode == "live":
-        print("     \u26a0 LIVE REAL MONEY — ack ok, dry-run=" + str(c.dry_run))
+        print("     \u26a0 LIVE REAL MONEY — ack ok, dry-run=" + str(c.dry_run)
+              + ("   [USDT-M perp — leveraged!]" if c.venue == "futures" else ""))
     if mode == "testnet":
-        print("     orders -> testnet.binance.vision (spot)   dry-run=" + str(c.dry_run))
+        tgt = ("testnet.binancefuture.com (USDT-M perp)" if c.venue == "futures"
+               else "testnet.binance.vision (spot)")
+        print(f"     orders -> {tgt}   dry-run=" + str(c.dry_run))
     if mode == "paper":
         print("     paper fills (no exchange orders). Set MODE/BINANCE_* env to go live.")
     print("=" * 68)

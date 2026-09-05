@@ -38,14 +38,16 @@ def main():
     else:
         use_ws = cfg.feed == "ws" and HAVE_WS
         if use_ws:
-            feed = BinanceWSFeed(symbol=cfg.symbol)
+            feed = BinanceWSFeed(symbol=cfg.symbol, venue=cfg.venue)
             feed.bootstrap()
             feed.start()
-            mode_label = f"{cfg.symbol} live via Binance WS stream (15m, push)"
+            mode_label = (f"{cfg.symbol} live via Binance {cfg.venue} WS stream "
+                          "(15m, push)")
         else:
-            feed = BinanceFeed(symbol=cfg.symbol)
+            feed = BinanceFeed(symbol=cfg.symbol, venue=cfg.venue)
             feed.bootstrap()
-            mode_label = f"{cfg.symbol} live via Binance data-api (15m, poll)"
+            mode_label = (f"{cfg.symbol} live via Binance {cfg.venue} REST klines "
+                          "(15m, poll)")
             if cfg.feed == "ws":
                 print("[!] websocket-client not installed — FEED=rest fallback "
                       "(pip install websocket-client for push)", flush=True)
