@@ -131,19 +131,34 @@ round-trip cost tolerance; PAXG spreads are small but not free).
 - `run.py`       main loop (feed → strategy → broker → dashboard)
 - `config.py`    env/CLI config & mode resolution
 - `strategy.py`  streaming engine, validated 1:1 vs `engine.py` (`live/validate.py`)
-- `datafeed.py`  BinanceWSFeed (push, auto-reconnect + REST backfill), BinanceFeed (REST poll) & ReplayFeed (XAU CSV)
-- `broker.py`    PaperBroker / BinanceBroker(testnet+live), auto dry-run
-- `server.py`    http/SSE endpoints; `dashboard_html.py` → UI
+- `datafeed.py`  BinanceWSFeed (push, auto-reconnect + REST backfill), BinanceFeed (REST poll), BybitFeed (USDT perps) & ReplayFeed (XAU CSV)
+- `broker.py`    PaperBroker / BinanceBroker(spot+futures, testnet+live), auto dry-run
+- `server.py`    http/SSE endpoints; `dashboard_html.py` → generated UI (`sync_dashboard.py` from `dashboard.html`; `tvprofile.js` = node-tested VP engine)
 - `validate.py`  full-history parity test vs backtest
 
 ## Dashboard (served, self-contained, no CDN)
-- KPI row: last price, PD PoC, session open, bias, phase, ATR, session, equity
-- Main chart: 15m candles, **PD volume profile histogram + PoC line**,
-  position entry/SL/TP and trail-lock markers
-- Prior-session profile mini-panel · trade log · equity curve · live event log ·
-  broker/order status · config panel
+- KPI row: last price, engine PD PoC (trade trigger), TV POC, value area,
+  session open, bias, phase, ATR, session, equity
+- Main chart: 15m candles, **TradingView-methodology volume profile** (rows
+  selectable 12/24/48/96; up/down volume coloring; value-area shading; VAH/VAL),
+  **TV POC** line, **developing POC** (active session), **engine PoC** line
+  (48-bin 4H FRVP — the trade trigger), position entry/SL/TP markers
+- Prior-session profile mini-panel with engine-PoC comparison · trade log ·
+  equity curve · live event log · broker/order status · config panel
 - Data endpoints: `/` (app), `/api/state` (JSON), `/api/snapshot` (JSON),
   `/api/events` (SSE push)
+
+**TV profile methodology** (per TradingView's "Volume profile indicators: basic
+concepts"): fixed row count over the session hi–lo; each bar's volume is
+distributed across the rows its range spans proportionally to overlap, split
+into up volume (close ≥ open) and down volume; POC = centre of the max-volume
+row; value area (default 70%) grows from the POC by repeatedly adding the
+larger adjacent row, stopping before overshooting the target (ties → row
+closer to POC, then above); VAH/VAL = the VA's top/bottom. Computed client-side
+from `prev_session_bars`/`active_session_bars` shipped by the engine (same
+bars the engine profiles). The pure functions live in `dashboard.html` and are
+mirrored in `tvprofile.js` for node testing; `dashboard_html.py` is generated
+from `dashboard.html` via `python3 -m live.sync_dashboard`.
 
 ## Honest limitations
 - Backtest fills are exact (entry at PoC touch, stop/TP at level, bar-close SL

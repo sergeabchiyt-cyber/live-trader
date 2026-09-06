@@ -89,6 +89,7 @@ class Strategy:
         self.prev_c = None
         self.prev_poc = None
         self.prev_prof = None
+        self.prev_bars: List[Bar] = []      # retained for the dashboard (TV-style VP)
         self.active_sd = None
         self.active_start = None
         self.session_bars: List[Bar] = []
@@ -160,9 +161,11 @@ class Strategy:
                 prof = compute_poc(self.session_bars, self.active_start, self.cfg.bins)
                 self.prev_prof = prof
                 self.prev_poc = prof["poc"] if prof else None
+                self.prev_bars = list(self.session_bars)   # dashboard: TV-style VP source
             else:
                 self.prev_prof = None
                 self.prev_poc = None
+                self.prev_bars = []
             self.active_sd = sd
             self.active_start = int(datetime.combine(
                 sd, datetime.min.time(), tzinfo=timezone.utc).timestamp()) \
@@ -324,6 +327,11 @@ class Strategy:
             session_bars=len(self.session_bars),
             total_bars=len(self.bars),
             prev_profile=self.prev_prof,
+            # dashboard sources for the TradingView-style volume profile:
+            prev_session_bars=[dict(ts=b.ts, o=b.o, h=b.h, l=b.l, c=b.c, v=b.v)
+                               for b in self.prev_bars],
+            active_session_bars=[dict(ts=b.ts, o=b.o, h=b.h, l=b.l, c=b.c, v=b.v)
+                                 for b in self.session_bars],
         )
 
     def _unrl(self):

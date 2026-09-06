@@ -108,7 +108,7 @@ def main():
             st["balance"] = broker.balance()
             pp = getattr(broker, "paper", broker)   # paper ledger (any broker)
             st["equity_curve"] = pp.equity_curve[-400:]
-            st["recent_bars"] = [dict(ts=b.ts, o=b.o, h=b.h, l=b.l, c=b.c)
+            st["recent_bars"] = [dict(ts=b.ts, o=b.o, h=b.h, l=b.l, c=b.c, v=b.v)
                                  for b in strat.bars[-240:]]
             st["last_trades"] = strat.trades[-40:]
             st["broker_status"] = getattr(broker, "status", [])[-20:]
