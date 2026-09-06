@@ -1,8 +1,6 @@
 target/
 rust/target/
-bin/
 legacy/
 cache/
 *.log
 .git/
-AUDIT.md
