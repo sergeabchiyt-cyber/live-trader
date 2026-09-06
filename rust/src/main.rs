@@ -1,246 +1,314 @@
-//! frvp — FRVP PoC gold strategy core (Rust)
+//! FRVP live trader v2 (Rust) — full service: Bybit/Binance REST feed, FRVP
+//! strategy engine, fee-aware paper ledger, Binance order mirroring, threaded
+//! HTTP + WebSocket push server, embedded terminal dashboard.
 //!
-//!   frvp replay <csv>          replay a ts(ms),o,h,l,c,v CSV and report trades
-//!   frvp bench  <csv>          timing micro-benchmark (whole-history replay)
-//!   frvp live [SYMBOL] [POLL]  live loop over Binance public data-api (PAXGUSDT)
-//!
-//! Parity target: replay of the XAUUSD 2016→2026 cache with
-//! RR=2, trail=[0.6:0.1,0.75:0.4,0.9:0.7], same-bar exits, no hour-skip yields
-//! n=1804 trades, net=+66.20%, SL/TP/EOS = 1438/347/19 (matches Python engine).
+//!   live-trader                 serve (default; env-configured)
+//!   live-trader replay <csv>    parity replay: ts(ms),o,h,l,c,v -> trades JSON
+//!   live-trader bench <csv>     timing micro-benchmark
 
+mod broker;
+mod config;
+mod dashboard;
 mod engine;
+mod feed;
+mod http;
+mod hub;
+mod ledger;
+mod ws;
 
-use engine::{Bar, Strategy, StrategyCfg};
-use std::time::Instant;
+use engine::{Bar, Event, Strategy, StrategyCfg};
+use hub::Hub;
+use serde_json::{json, Value};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-const LADDER: [(f64, f64); 3] = [(0.6, 0.1), (0.75, 0.4), (0.9, 0.7)];
+fn strategy_cfg(c: &config::Config) -> StrategyCfg {
+    StrategyCfg {
+        rr: c.rr,
+        skip_hour0: c.skip_hour0,
+        trail_on: c.trail_on,
+        ladder: c.ladder.clone(),
+        same_bar_exits: c.same_bar,
+        sl_touch: c.sl_touch,
+    }
+}
 
+// ---------------------------------------------------------------------------
+// replay / parity
+// ---------------------------------------------------------------------------
 fn parse_csv(path: &str) -> Vec<Bar> {
-    let raw = std::fs::read_to_string(path).expect("read csv");
+    let raw = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read csv: {e}"));
     let mut bars = Vec::with_capacity(260_000);
     for line in raw.lines().skip(1) {
         if line.is_empty() {
             continue;
         }
         let mut it = line.split(',');
-        let ts_ms: f64 = match it.next() {
-            Some(x) => x.parse().unwrap_or(0.0),
-            None => continue,
-        };
-        let o: f64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0);
-        let h: f64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0);
-        let l: f64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0);
-        let c: f64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0);
-        let v: f64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0);
+        let ts_ms: f64 = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0);
+        let o = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0);
+        let h = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0);
+        let l = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0);
+        let c = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0);
+        let v = it.next().and_then(|x| x.parse().ok()).unwrap_or(0.0);
         bars.push(Bar { ts: (ts_ms / 1000.0) as i64, o, h, l, c, v });
     }
+    bars.sort_by_key(|b| b.ts);
     bars
 }
 
-fn run_replay(bars: &[Bar], cfg: StrategyCfg) -> (Strategy, f64) {
-    let t0 = Instant::now();
-    let mut s = Strategy::new(cfg);
-    for b in bars {
-        s.on_bar(b);
-    }
-    let elapsed = t0.elapsed();
-    (s, elapsed.as_secs_f64())
-}
-
-fn print_trades(s: &Strategy) {
-    let mut sl = 0;
-    let mut tp = 0;
-    let mut eos = 0;
-    for t in &s.trades {
-        match t.exit_type.as_str() {
-            "SL" => sl += 1,
-            "TP" => tp += 1,
-            _ => eos += 1,
-        }
-    }
-    let n = s.trades.len();
-    let wins = s.trades.iter().filter(|t| t.pct > 0.0).count();
-    let net = s.net();
-    println!("trades      : {n}");
-    println!("win rate    : {:.1}%", 100.0 * wins as f64 / n as f64);
-    println!("net         : {net:+.2}%");
-    println!("exit mix    : SL {sl} / TP {tp} / EOS {eos}");
-    if !s.trades.is_empty() {
-        let (first, last) = (&s.trades[0], &s.trades[s.trades.len() - 1]);
-        println!("first/last  : {} .. {}", first.session, last.session);
-    if std::env::var("FRVP_DUMP").is_ok() {
-        for t in &s.trades {
-            println!("DUMP\t{}\t{}\t{}\t{:.4}\t{:.4}\t{}\t{}\t{:.4}\t{:.4}\t{:.4}\t{:.4}\t{}\t{:.4}\t{:.6}", t.session, t.side, t.exit_type, t.pct, t.r, t.entry_ts, t.exit_ts, t.entry, t.sl, t.tp, t.exit, t.bars_held, t.trail_a, t.slp);
-        }
-    }
-    }
-}
-
-fn cmd_replay(path: &str, rr: f64, skip0: bool) {
+fn cmd_replay(path: &str, touch: bool, json_out: bool) {
     let bars = parse_csv(path);
     let cfg = StrategyCfg {
-        rr,
-        skip_hour0: skip0,
+        rr: 2.0,
+        skip_hour0: false,
         trail_on: true,
-        ladder: LADDER.to_vec(),
+        ladder: config::DEFAULT_LADDER.to_vec(),
         same_bar_exits: true,
+        sl_touch: touch,
     };
-    let (s, secs) = run_replay(&bars, cfg);
-    println!("replay of {} bars in {secs:.4}s ({:.0} bars/s)", bars.len(), bars.len() as f64 / secs);
-    print_trades(&s);
+    let t0 = std::time::Instant::now();
+    let mut s = Strategy::new(cfg);
+    for b in &bars {
+        s.on_bar(b);
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+    if json_out {
+        let trades: Vec<Value> = s.trades.iter().map(|t| t.to_json()).collect();
+        println!("{}", serde_json::to_string(&trades).unwrap());
+        return;
+    }
+    let n = s.trades.len();
+    let sl = s.trades.iter().filter(|t| t.exit_type == "SL").count();
+    let tp = s.trades.iter().filter(|t| t.exit_type == "TP").count();
+    let eos = s.trades.iter().filter(|t| t.exit_type == "EOS").count();
+    let wins = s.trades.iter().filter(|t| t.pct > 0.0).count();
+    println!("replay of {} bars in {elapsed:.4}s ({:.0} bars/s)", bars.len(), bars.len() as f64 / elapsed);
+    println!("trades      : {n}");
+    println!("win rate    : {:.1}%", 100.0 * wins as f64 / n.max(1) as f64);
+    println!("net         : {:+.2}%", s.net());
+    println!("exit mix    : SL {sl} / TP {tp} / EOS {eos}");
 }
 
 fn cmd_bench(path: &str) {
-    let t0 = Instant::now();
     let bars = parse_csv(path);
-    let parse_s = t0.elapsed().as_secs_f64();
-    println!("parse {} bars: {parse_s:.4}s", bars.len());
-    let cfg = StrategyCfg { rr: 2.0, skip_hour0: false, trail_on: true, ladder: LADDER.to_vec(), same_bar_exits: true };
-    // 3 warm-up runs then 10 timed
-    let _ = run_replay(&bars, cfg.clone());
+    let cfg = StrategyCfg {
+        rr: 2.0,
+        skip_hour0: false,
+        trail_on: true,
+        ladder: config::DEFAULT_LADDER.to_vec(),
+        same_bar_exits: true,
+        sl_touch: false,
+    };
+    let _ = {
+        let mut s = Strategy::new(cfg.clone());
+        for b in &bars {
+            s.on_bar(b);
+        }
+        s.net()
+    };
     let mut times = Vec::new();
     for _ in 0..10 {
-        let (_, secs) = run_replay(&bars, cfg.clone());
-        times.push(secs);
+        let t = std::time::Instant::now();
+        let mut s = Strategy::new(cfg.clone());
+        for b in &bars {
+            s.on_bar(b);
+        }
+        std::hint::black_box(s.net());
+        times.push(t.elapsed().as_secs_f64());
     }
     times.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let best = times[0];
-    println!("full-engine replay best-of-10 : {best:.5}s  -> {:.0} bars/s  ({:.0} µs/bar)", bars.len() as f64 / best, best * 1e6 / bars.len() as f64);
-    // FRVP/PoC hot loop benchmark: recompute profiles over rolling windows
-    let t0 = Instant::now();
-    let mut hits = 0usize;
-    let mut prof_acc = 0.0f64;
-    let mut idx = 0usize;
-    while idx + 96 <= bars.len() {
-        let win = &bars[idx..idx + 96];
-        if let Some((_hi, lo, _w, prof, poc)) = engine::compute_poc(win, win[0].ts) {
-            hits += 1;
-            prof_acc += prof.iter().sum::<f64>() + poc - lo;
-        }
-        idx += 96;
-    }
-    let dur = t0.elapsed().as_secs_f64();
-    println!("FRVP compute  : {hits} sessions in {dur:.4}s -> {:.0} sess/s", hits as f64 / dur);
-    std::hint::black_box(prof_acc);
-}
-
-// ---------------------------------------------------------------------------
-// live Binance public data-api feed (no keys). v-proxy = #trades per kline.
-// ---------------------------------------------------------------------------
-fn http_json(url: &str) -> Result<serde_json::Value, String> {
-    let resp = ureq::get(url)
-        .set("User-Agent", "frvp-rust/0.1")
-        .timeout(std::time::Duration::from_secs(12))
-        .call()
-        .map_err(|e| e.to_string())?;
-    resp.into_json().map_err(|e| e.to_string())
-}
-
-fn fetch_klines(symbol: &str, limit: usize) -> Result<Vec<Bar>, String> {
-    let url = format!(
-        "https://data-api.binance.vision/api/v3/klines?symbol={symbol}&interval=15m&limit={limit}"
+    println!(
+        "full-engine replay best-of-10: {best:.5}s -> {:.0} bars/s ({:.2} us/bar)",
+        bars.len() as f64 / best,
+        best * 1e6 / bars.len() as f64
     );
-    let j = http_json(&url)?;
-    let arr = j.as_array().ok_or("bad payload")?;
-    let now_ms = now_ms();
-    let mut out = Vec::with_capacity(arr.len());
-    for k in arr {
-        let row = k.as_array().ok_or("bad row")?;
-        let open_ms: i64 = row[0].as_i64().unwrap_or(0);
-        if open_ms + 900_000 > now_ms {
-            continue; // only closed bars
-        }
-        let get = |i: usize| row[i].as_str().and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
-        out.push(Bar {
-            ts: open_ms / 1000,
-            o: get(1),
-            h: get(2),
-            l: get(3),
-            c: get(4),
-            v: get(8), // number of trades -> tick proxy
-        });
+}
+
+// ---------------------------------------------------------------------------
+// serve (the live service)
+// ---------------------------------------------------------------------------
+fn cmd_serve() {
+    let cfg = config::Config::from_env();
+    config::banner(&cfg);
+    let hub = Arc::new(Hub::new());
+    if http::serve(&cfg, hub.clone()).is_err() {
+        eprintln!("[fatal] could not bind {}:{} — exiting", cfg.host, cfg.port);
+        std::process::exit(1);
     }
-    Ok(out)
-}
 
-fn now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
-}
+    let feed = Arc::new(Mutex::new(feed::RestFeed::new(&cfg)));
+    let mut broker = broker::Broker::new(&cfg);
+    let mut strat = Strategy::new(strategy_cfg(&cfg));
+    let mut trades_log: Vec<Value> = Vec::new();
 
-fn cmd_live(symbol: &str, poll_s: u64, skip0: bool, rr: f64) {
-    let cfg = StrategyCfg { rr, skip_hour0: skip0, trail_on: true, ladder: LADDER.to_vec(), same_bar_exits: true };
-    let boot = match fetch_klines(symbol, 1000) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("bootstrap failed: {e}");
-            return;
+    // ---- bootstrap (retry forever; HTTP is already serving health checks) --
+    let boot_bars = loop {
+        let mut f = feed.lock().unwrap();
+        match f.bootstrap() {
+            Ok(bars) => break bars,
+            Err(e) => {
+                println!("[feed] bootstrap failed: {e} — retrying in 5s");
+                drop(f);
+                hub.publish(
+                    "health",
+                    json!({"status": "bootstrapping", "error": e}),
+                );
+                std::thread::sleep(Duration::from_secs(5));
+            }
         }
     };
-    println!("[frvp-live] {symbol} 15m — bootstrapped {} closed bars (PD profile warm)", boot.len());
-    let mut s = Strategy::new(cfg);
-    for b in &boot {
-        s.on_bar(b);
+    println!("[feed] bootstrapped {} closed bars", boot_bars.len());
+
+    // ---- warm the engine on history (quiet: no hub publish, no orders,
+    //      but the ledger replays every historical trade with fees) ---------
+    let warm_events = strat.feed_history(&boot_bars);
+    for ev in &warm_events {
+        match ev {
+            Event::Open { entry, slp, .. } => {
+                broker.ledger.on_open(*entry, *slp);
+            }
+            Event::Close(t) => {
+                let enriched = broker.quiet_close(t);
+                trades_log.push(enriched);
+            }
+            _ => {}
+        }
     }
-    let mut last_ts = boot.last().map(|b| b.ts).unwrap_or(0);
-    println!("[state] session {} bias {:?} prev_poc {:?} trades {}", s.active_session(), s.bias, s.prev_poc, s.trades.len());
+    println!(
+        "[engine] warm: {} bars, session {:?}, prev_poc {:?}, {} trades replayed (ledger equity {:.2})",
+        boot_bars.len(),
+        strat.active_session(),
+        strat.prev_poc,
+        trades_log.len(),
+        broker.ledger.equity
+    );
+
+    // ---- ~1s tick publisher (cheap ticker poll; WS + SSE fan-out) ---------
+    {
+        let hub_t = hub.clone();
+        let feed_t = feed.clone();
+        let tick_s = cfg.tick_s.clamp(0.25, 10.0);
+        std::thread::Builder::new()
+            .name("tick-pub".into())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_secs_f64(tick_s));
+                let px = {
+                    let mut f = feed_t.lock().unwrap();
+                    f.poll_ticker()
+                };
+                if let Some(p) = px {
+                    hub_t.publish("tick", json!({"price": p, "ts": engine::now_ts_f64()}));
+                }
+            })
+            .ok();
+    }
+
+    // ---- main loop: poll klines -> engine -> publish state ----------------
+    let poll = cfg.poll_s.clamp(0.5, 10.0);
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(poll_s));
-        match fetch_klines(symbol, 6) {
-            Ok(nb) => {
-                for b in nb {
-                    if b.ts > last_ts {
-                        s.on_bar(&b);
-                        last_ts = b.ts;
-                        println!(
-                            "[bar] {} o {:.2} c {:.2} | session {} bias {:?} prev_poc {:.1} | trades {} net {:.2}% | last exit: {}",
-                            iso(b.ts), b.o, b.c,
-                            s.active_session(),
-                            s.bias,
-                            s.prev_poc.unwrap_or(0.0),
-                            s.trades.len(),
-                            s.net(),
-                            s.trades.last().map(|t| t.exit_type.clone()).unwrap_or_default(),
-                        );
+        std::thread::sleep(Duration::from_secs_f64(poll));
+        let new_bars = {
+            let mut f = feed.lock().unwrap();
+            f.poll()
+        };
+        for b in new_bars {
+            let evs = strat.on_bar(&b);
+            for ev in evs {
+                match ev {
+                    Event::Session { .. } => {
+                        hub.publish("session", ev.to_json());
+                    }
+                    Event::Open { side, entry, sl, tp, slp, .. } => {
+                        hub.publish("open", ev.to_json());
+                        broker.on_open(side, entry, sl, tp, slp);
+                    }
+                    Event::Trail { sl, .. } => {
+                        hub.publish("trail", ev.to_json());
+                        broker.on_trail(sl);
+                    }
+                    Event::Close(ref t) => {
+                        let enriched = broker.on_close(t);
+                        trades_log.push(enriched.clone());
+                        if trades_log.len() > 400 {
+                            let drop = trades_log.len() - 300;
+                            trades_log.drain(0..drop);
+                        }
+                        hub.publish("close", enriched);
                     }
                 }
             }
-            Err(e) => eprintln!("[feed] {e}"),
         }
+        publish_state(&hub, &cfg, &strat, &broker, &feed, &trades_log);
     }
 }
 
-fn iso(ts: i64) -> String {
-    let days = ts.div_euclid(86400);
-    let (y, m, d) = engine::civil_from_days(days);
-    let tod = ts.rem_euclid(86400);
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}Z", tod / 3600, (tod % 3600) / 60, tod % 60)
+fn publish_state(
+    hub: &Arc<Hub>,
+    cfg: &config::Config,
+    strat: &Strategy,
+    broker: &broker::Broker,
+    feed: &Arc<Mutex<feed::RestFeed>>,
+    trades_log: &[Value],
+) {
+    let mut st = strat.state();
+    let (last_price, feed_health, venue_label) = {
+        let f = feed.lock().unwrap();
+        (f.last_price, f.health.to_json(), f.venue_label())
+    };
+    st["mode"] = json!(cfg.display_mode());
+    st["symbol"] = json!(cfg.symbol);
+    st["source"] = json!(format!("{} ({})", cfg.source_label(), venue_label));
+    let lb_close = st.get("last_bar").and_then(|b| b.get("c")).cloned();
+    st["last_price"] = match last_price {
+        Some(p) => json!(p),
+        None => lb_close.unwrap_or(Value::Null),
+    };
+    st["balance"] = broker.balance();
+    st["equity_curve"] = broker.ledger.equity_curve_json();
+    st["recent_bars"] = strat
+        .bars
+        .iter()
+        .rev()
+        .take(240)
+        .rev()
+        .map(|b| json!({"ts": b.ts, "o": b.o, "h": b.h, "l": b.l, "c": b.c, "v": b.v}))
+        .collect::<Vec<_>>()
+        .into();
+    st["last_trades"] = trades_log.iter().rev().take(40).cloned().collect::<Vec<_>>().into();
+    st["broker_status"] = broker.status_json();
+    st["feed_health"] = feed_health.clone();
+    st["engine"] = json!(http::ENGINE_VERSION);
+    st["config"] = json!({
+        "rr": cfg.rr, "skip_hour0": cfg.skip_hour0, "trail_on": cfg.trail_on,
+        "ladder": cfg.ladder, "symbol": cfg.symbol,
+        "sl_mode": if cfg.sl_touch { "touch" } else { "close" },
+        "fee_maker_pct": cfg.fee_maker_pct, "fee_taker_pct": cfg.fee_taker_pct,
+        "sl_slip_pct": cfg.sl_slip_pct,
+        "legacy_sizing": cfg.legacy_sizing, "position_usd": cfg.position_usd,
+        "risk_pct": cfg.risk_pct, "leverage_cap": cfg.leverage_cap,
+        "poll_s": cfg.poll_s,
+    });
+    hub.publish("state", st);
+    hub.publish(
+        "health",
+        json!({"status": "ok", "engine": http::ENGINE_VERSION, "feed": feed_health}),
+    );
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        println!("frvp (FRVP PoC core)\n  frvp replay <csv> [rr] [skip0 0|1]\n  frvp bench <csv>\n  frvp live [SYMBOL] [POLL_S] [rr] [skip0]");
-        return;
+    match args.get(1).map(|s| s.as_str()) {
+        Some("replay") => {
+            let path = args.get(2).expect("usage: live-trader replay <csv> [--touch] [--json]");
+            let touch = args.iter().any(|a| a == "--touch");
+            let json_out = args.iter().any(|a| a == "--json");
+            cmd_replay(path, touch, json_out);
+        }
+        Some("bench") => {
+            let path = args.get(2).expect("usage: live-trader bench <csv>");
+            cmd_bench(path);
+        }
+        _ => cmd_serve(),
     }
-    match args[1].as_str() {
-        "replay" => {
-            let path = args.get(2).expect("csv path");
-            let rr = args.get(3).and_then(|x| x.parse().ok()).unwrap_or(2.0);
-            let skip0 = args.get(4).map(|x| x == "1").unwrap_or(false);
-            cmd_replay(path, rr, skip0);
-        }
-        "bench" => cmd_bench(args.get(2).expect("csv path")),
-        "live" => {
-            let symbol = args.get(2).map(|s| s.as_str()).unwrap_or("PAXGUSDT");
-            let poll = args.get(3).and_then(|x| x.parse().ok()).unwrap_or(10u64);
-            let rr = args.get(4).and_then(|x| x.parse().ok()).unwrap_or(2.0);
-            let skip0 = args.get(5).map(|x| x == "1").unwrap_or(true);
-            cmd_live(symbol, poll, skip0, rr);
-        }
-        _ => {
-            eprintln!("unknown command {}", args[1]);
-        }
-    }
-    std::hint::black_box(());
 }

@@ -1,47 +1,44 @@
-# Render blueprint for the FRVP PoC live trader (web service).
+# Render blueprint for the FRVP live trader v2 (Rust).
 #
-# Deploy: Render dashboard -> "New +" -> "Blueprint" -> pick this repo.
-# After the service is created, fill in the two secrets (BINANCE_API_KEY /
-# BINANCE_API_SECRET) in the Render dashboard Env tab, then Deploy.
+# Fresh deploys: this blueprint builds the static musl binary in Docker and
+# runs it (~15MB image, <1s cold start).
 #
-# Architecture on Render (Binance blocks datacenter IPs — HTTP 418 — from its
-# MAINNET futures endpoints; spot *.binance.vision public data is exempt):
-#   * MARKET DATA  (DATA_VENUE=bybit): real XAUUSDT gold-perp klines from
-#     Bybit's public v5 REST API (api.bybit.com, no keys, poll every POLL_S).
-#     Volume profile weighted by real traded volume.
-#   * ORDERS (VENUE=futures, MODE=testnet): Binance USDT-M FUTURES TESTNET
-#     (testnet.binancefuture.com — keys SEPARATE from the spot testnet, get
-#     them at https://testnet.binancefuture.com): LIMIT entries, reduceOnly
-#     STOP_MARKET SL + TAKE_PROFIT_MARKET TP, leverage 1x.
-#   * Alternatives: DATA_VENUE=futures (Binance futures testnet data — synthetic
-#     volume) or DATA_VENUE=spot SYMBOL=PAXGUSDT (tokenized gold, real spot
-#     data via data-api.binance.vision; spot testnet can't trade it).
+# NOTE — the existing production service (live-trader-pxjv.onrender.com) was
+# created in 2026-09 with runtime: python, BEFORE this rewrite. Render does
+# not allow changing a service's runtime in place, so that service instead
+# runs the pre-built static binary committed at bin/live-trader-x86_64 with:
+#   buildCommand: echo "no build (prebuilt static binary in repo)"
+#   startCommand: ./bin/live-trader-x86_64
+# (keeping the original URL). Use THIS blueprint for any new service.
 #
-# Do NOT set PORT: Render injects it and the app binds to it automatically.
+# Architecture:
+#   * MARKET DATA (DATA_VENUE=bybit): XAUUSDT gold-perp klines from Bybit's
+#     public v5 REST API (no keys), 5s poll for bars + 1s ticker poll for
+#     live ticks. Volume profile weighted by real traded volume.
+#   * STRATEGY: FRVP PoC engine (session mean-reversion to prior-session
+#     value), 15m bars, engine-identical math (parity-tested).
+#   * LEDGER: fee-aware paper accounting (Bybit maker/taker), risk-based
+#     sizing shared with the order mirror (AUDIT.md fixes A1/A3).
+#   * ORDERS (VENUE=futures, MODE=testnet): Binance USDT-M futures testnet —
+#     LIMIT entries, reduceOnly STOP_MARKET SL + TAKE_PROFIT_MARKET TP.
+#   * KEEP-ALIVE: free-tier services sleep after 15 min without inbound
+#     traffic — point an uptime pinger at /api/ping (AUDIT.md B1).
 
 services:
   - type: web
     name: live-trader
-    runtime: python
+    runtime: docker
     plan: free
-    region: frankfurt  # choose a region whose IPs Binance/Bybit do not geo-block
-    buildCommand: pip install -r requirements.txt
-    startCommand: python3 -m live.run
+    region: frankfurt
     healthCheckPath: /api/state
     autoDeploy: true
     envVars:
-      # runtime
-      - key: PYTHONUNBUFFERED
-        value: "1"          # live logs on Render (no stdout buffering)
-      - key: FEED
-        value: rest         # bybit data venue is REST-poll by design
-      - key: POLL_S
-        value: "5"
-      # data venue + mode + order routing
       - key: DATA_VENUE
-        value: bybit        # bybit (real XAUUSDT perp data) | spot | futures
+        value: bybit
+      - key: SYMBOL
+        value: XAUUSDT
       - key: VENUE
-        value: futures      # order routing: futures (USDT-M perp) | spot
+        value: futures
       - key: MODE
         value: testnet
       - key: BINANCE_TESTNET
@@ -52,14 +49,21 @@ services:
         sync: false         # fill in Render dashboard (FUTURES testnet key)
       - key: BINANCE_API_SECRET
         sync: false         # fill in Render dashboard (FUTURES testnet secret)
-      # strategy / instrument
-      - key: SYMBOL
-        value: XAUUSDT      # gold perp (data: Bybit; orders: Binance f-testnet)
-      - key: POSITION_USD
-        value: "20"
       - key: RR
         value: "2.0"
       - key: SKIP_HOUR0
         value: "1"
       - key: SAME_BAR
         value: "1"
+      - key: SL_MODE
+        value: touch        # touch = exchange-realistic fills (close = legacy)
+      - key: FEE_MAKER_PCT
+        value: "0.02"       # Bybit perp base tier
+      - key: FEE_TAKER_PCT
+        value: "0.055"
+      - key: RISK_PCT
+        value: "0.5"        # % of paper equity risked per trade
+      - key: LEVERAGE_CAP
+        value: "3.0"        # notional cap = 3x paper equity
+      - key: POLL_S
+        value: "5"

@@ -1,134 +1,103 @@
-# live-trader — FRVP PoC gold trading bot (Python dashboard + Rust core)
+# FRVP live trader v2 — Rust
 
-A real-time **prev-day FRVP PoC** intraday strategy for tokenised/spot gold, shipping in two
-languages that are **byte-for-byte engine-parity equivalent**:
+Live session-mean-reversion trader for the XAUUSDT gold perp: prior-session
+volume-profile value (PoC) as the reference level, ATR-scaled stops, milestone
+trailing, one trade per session, flat by session end. **Rust service**:
+Bybit/Binance REST feed → FRVP engine → fee-aware paper ledger → optional
+Binance futures-testnet order mirroring → HTTP + WebSocket push → embedded
+terminal dashboard.
 
-| Component | Language | What it is |
-|---|---|---|
-| `live/` | Python | Streaming strategy, WebSocket data feed (push, no polling), broker layer (paper/testnet/live), HTTP+SSE dashboard, full-history parity check |
-| `rust/` | Rust | Same engine as a low-latency core — replay, benchmark and live feed loop (`frvp` binary) |
-
-The strategy: each session opens **22:00 UTC Sun–Thu**; the **previous session's volume
-profile** (FRVP, 4H buckets → 48 bins, PoC = centre of max-volume bin) sets the day bias
-(open above PD PoC → long the first touch of PoC; below → short). Stops are ATR14(15M),
-TP is fixed at `RR × SL`, and a **milestone trail** (60 % → +0.1R, 75 % → +0.4R,
-90 % → +0.7R) ratchets the stop toward profit. SL fills first on a same-bar conflict;
-one trade per session, flat at session end.
-
-> **Validation.** Replaying the full XAUUSD 15m history (2016-01 → 2026-09, 252,158 bars,
-> RR 2, trail ladder on, no hour-skip) reproduces the validated engine trade-for-trade:
-> **1,804 trades, net +66.20 %, SL 1438 / TP 347 / EOS 19** — identical in Python and Rust
-> (see [Parity](#parity)).
-
----
-
-## Why Rust?
-
-Python (`live/strategy.py`) is the reference engine and the dashboard backend — but a feed +
-strategy core is pure CPU work, so the same engine is ported 1:1 to Rust
-(`rust/src/engine.rs`). Measured on this machine (best-of-N full-history replay):
-
-| Engine | Best time (252,158 bars) | Throughput |
-|---|---|---|
-| Python `live.strategy` | ~1.23 s | ~0.20 M bars/s |
-| Rust `frvp replay` (release) | ~0.037 s | ~6.9 M bars/s |
-
-**≈ 33× faster engine**, identical output. Ten years of 15-minute bars replay in ~37 ms;
-a single closed bar (the live hot path) is ~150 ns of strategy work. The Rust `bench`
-subcommand reports both full-engine and FRVP/PoC-compute throughput.
-
----
+> **v2 audit:** see [`AUDIT.md`](AUDIT.md) for the full flaw research this
+> rewrite is based on (fee economics, fill asymmetry, sizing inconsistency,
+> Render free-tier sleep, feed-health visibility) and the complete list of
+> behavioural changes. The Python implementation is preserved under
+> [`legacy/`](legacy/) — trade-level parity is verified by
+> `tools/parity_*.py` (133/133 synthetic + 6/6 real trades identical).
 
 ## Layout
 
 ```
-live-trader/
-├── live/                  # Python package (validated engine + dashboard)
-│   ├── strategy.py        #   streaming engine (1:1 with the backtest engine)
-│   ├── datafeed.py        #   Binance public klines (PAXG) / XAU replay feed
-│   ├── broker.py          #   PaperBroker + Binance testnet/live, auto dry-run
-│   ├── config.py          #   env/CLI config + mode resolution
-│   ├── run.py             #   main loop + CLI entry (python3 -m live.run)
-│   ├── server.py          #   HTTP + SSE endpoints
-│   ├── dashboard.html     #   self-contained UI (no CDN)
-│   ├── validate.py        #   full-history parity test
-│   └── README.md          #   Python product docs (modes, env, testnet/live flow)
-├── rust/                  # Rust core (crate frvp-core → binary frvp)
-│   ├── src/engine.rs      #   exact engine port (no broker)
-│   ├── src/main.rs        #   frvp replay | bench | live
-│   ├── Cargo.toml
-│   └── README.md          #   build / parity / bench / live-feed docs
-└── README.md
+rust/            the Rust service (cargo crate)
+  src/engine.rs    FRVP strategy core (1:1 port + SL_MODE, events, state)
+  src/feed.rs      Bybit / Binance public REST feeds + health telemetry
+  src/ledger.rs    fee-aware paper ledger + risk-based sizing
+  src/broker.rs    Binance futures/spot order mirror (testnet/live)
+  src/http.rs      threaded HTTP server (dashboard, state, SSE, WS, health)
+  src/ws.rs        RFC 6455 framing + 30s keepalive pings
+  src/main.rs      serve loop + replay/bench subcommands
+  dashboard/       terminal UI (embedded into the binary via include_str!)
+bin/             prebuilt static musl binary (what the live service runs)
+legacy/          the previous Python implementation (reference)
+tools/           parity harness + mock Bybit server + bar generator
 ```
 
----
-
-## Python quick start
+## Run locally
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate   # optional
-cd live-trader
+cd rust && cargo run                # serve on :8765 (env-configured)
+cargo test                          # engine unit tests
 
-# 1) paper trading on LIVE PAXGUSDT data (default) -> dashboard on :8765
-python3 -m live.run --port 8765
+# parity check against the legacy Python engine
+python3 tools/gen_bars.py /tmp/bars.csv 30000
+cargo run --release -- replay /tmp/bars.csv --json > /tmp/trades_rust.json
+python3 tools/parity_python.py /tmp/bars.csv /tmp/trades_py.json
+python3 tools/parity_diff.py /tmp/trades_py.json /tmp/trades_rust.json
 
-# 2) demo on gold history (fast replay of recent XAUUSD)
-python3 -m live.run --source xau --replay-start 2026-08-25 --replay-speed 300 --port 8765
-
-# 3) state check while running
-curl http://127.0.0.1:8765/api/state
+# end-to-end without Bybit access (mock v5 API)
+python3 tools/mock_bybit.py /tmp/bars_real.csv 8791 &
+BYBIT_BASE=http://127.0.0.1:8791 PORT=8790 cargo run
 ```
 
-Open http://localhost:8765/ — candles with the **PD volume-profile + PoC overlay**,
-position/SL/TP/trail markers, trade log, equity curve and live events.
+## Environment
 
-**Data note:** the XAUUSD 15m replay dataset (`cache/XAUUSD_15m.csv`, 252,158 bars) is
-*not* committed to this repo — see `live/README.md` for the fetch/regen instructions,
-and `python3 live/validate.py` once you have it at `cache/XAUUSD_15m.csv`. Live data
-needs no keys — the feed is a **public WebSocket push**
-(`data-stream.binance.vision` for spot, `fstream.binance.com` for USDT-M perps;
-set `FEED=rest` to fall back to polling). `VENUE=futures SYMBOL=XAUUSDT` runs the
-strategy on the gold TRADFI perpetual (orders → USDT-M futures testnet).
+All v1 variable names still work. New v2 economics knobs (defaults shown):
 
-Modes (env-driven): `paper` (default, exact-fill on live data) · `testnet` · `live`.
-Live/testnet are always dry-run unless you opt out — see the env table in `live/README.md`.
+| var | default | meaning |
+|---|---|---|
+| `SL_MODE` | `touch` | `touch` = exchange-realistic fills; `close` = legacy backtest conventions |
+| `FEE_MAKER_PCT` | `0.02` | paper-ledger maker fee (entry LIMIT) |
+| `FEE_TAKER_PCT` | `0.055` | taker fee (SL/TP/EOS are market-type exits) |
+| `SL_SLIP_PCT` | `0` | adverse slippage charged on stop fills |
+| `RISK_PCT` | `0.5` | % of paper equity risked per trade |
+| `LEVERAGE_CAP` | `3.0` | notional cap = cap × equity |
+| `LEGACY_SIZING` | `0` | `1` = fixed `POSITION_USD` notional (v1 behaviour) |
+| `BYBIT_BASE` | bybit.com | override for tests / geo-blocks |
 
-## Rust quick start
+Legacy: `SYMBOL`, `DATA_VENUE` (bybit|spot|futures), `VENUE`, `MODE`,
+`BINANCE_TESTNET`, `BINANCE_DRY_RUN`, `BINANCE_API_KEY/SECRET`, `RR`,
+`SKIP_HOUR0`, `TRAIL`, `TRAIL_LADDER`, `SAME_BAR`, `POSITION_USD`, `POLL_S`,
+`PORT`, `HOST`, `PAPER_START_USDT`.
 
-```bash
-cd rust
-cargo build --release                      # -> rust/target/release/frvp
+## HTTP API
 
-# replay with the parity config (expect: 1804 trades, net +66.20%)
-./target/release/frvp replay ../cache/XAUUSD_15m.csv 2.0 0
+| endpoint | description |
+|---|---|
+| `/` | terminal dashboard (single file, no CDN) |
+| `/api/ws` | WebSocket push: `state` (every poll), `tick` (~1s), `open`/`close`/`trail`/`session` events — envelope `{type, ts, data}` |
+| `/api/state` | latest state snapshot (REST fallback / initial load) |
+| `/api/events` | SSE stream (legacy compatibility) |
+| `/api/health` | liveness + engine version (uptime pingers: `/api/ping`) |
+| `/api/snapshot` | all hub snapshots (state + last event per kind) |
 
-# latency benchmark (best-of-10 full-history replay + FRVP compute)
-./target/release/frvp bench ../cache/XAUUSD_15m.csv
+## Deployment (Render)
 
-# live PAXGUSDT 15m loop over Binance public klines (no keys)
-./target/release/frvp live PAXGUSDT 10 2.0 1
-```
+* **Fresh service:** use `render.yaml` (Docker build, ~15MB image).
+* **The existing service** (`live-trader-pxjv.onrender.com`, created with
+  runtime: python — runtime is immutable on Render): runs the committed static
+  binary directly:
+  * buildCommand: `echo "no build (prebuilt static binary in repo)"`
+  * startCommand: `./bin/live-trader-x86_64`
+* Rebuild the committed binary after code changes:
+  ```bash
+  cd rust && cargo build --release --target x86_64-unknown-linux-musl
+  cp target/x86_64-unknown-linux-musl/release/live-trader ../bin/live-trader-x86_64
+  ```
+* **Keep-alive (free tier):** services sleep after 15 min without inbound
+  traffic — point an uptime pinger at `/api/ping`, or use a paid instance
+  (AUDIT.md B1). This matters as soon as order mirroring is enabled.
 
-## Parity
+## Honest-economics quick reference
 
-`rust/src/engine.rs` is a straight port of `live/strategy.py` — same session calendar
-(22:00 roll, Sun–Thu starts), same FRVP/PoC math (first-max bin convention), same ATR14,
-same asymmetric SL/TP fill conventions, same-bar exit scan and milestone ladder. Proven by
-replaying identical bars through both engines:
-
-```
-python3 live/validate.py          # Python vs backtest oracle  -> 0 mismatches
-frvp replay cache/XAUUSD_15m.csv 2.0 0   # Rust vs Python trade list -> byte-identical
-```
-
-Result (both): **1804 trades · net +66.20 % · SL 1438 / TP 347 / EOS 19**.
-
-## Honest limitations
-
-- Binance **spot order endpoints** (`api.binance.com`, `testnet.binance.vision`) are
-  geo-blocked from some sandboxes (HTTP 451) — the order code is included and validated
-  from a normal machine; from restricted environments you get paper execution on live data
-  or the XAUUSD replay feed.
-- Backtest fills are exact (touch-at-PoC, level SL/TP). Expect modest slippage live —
-  start paper, then testnet, then small size.
-- The 00:00–01:00 UTC entry skip (`SKIP_HOUR0`) matters more live than in backtest; keep it on.
+At 15m-gold ATR ≈ 0.065% stops, one round trip costs ≈ 0.075% ≈ **1.16R** —
+a 2R winner nets ≈ +1.38R, a 1R loser nets ≈ −2.16R. The dashboard shows
+fees, net-R and `fee/1R` live so results are never flattering by accident.

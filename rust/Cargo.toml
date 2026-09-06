@@ -1,19 +1,21 @@
 [package]
-name = "frvp-core"
-version = "0.1.0"
+name = "live-trader"
+version = "2.0.0"
 edition = "2021"
-description = "Low-latency FRVP PoC gold strategy core (Rust) — mirrors the validated Python engine exactly"
+description = "FRVP PoC gold trader — Rust service: Bybit/Binance feed, strategy engine, fee-aware paper ledger, Binance order mirror, HTTP + WebSocket push, embedded terminal dashboard"
+license = "MIT"
 
 [[bin]]
-name = "frvp"
+name = "live-trader"
 path = "src/main.rs"
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "thin"
 codegen-units = 1
+strip = true
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2", features = ["json"] }
+ring = "0.17"
