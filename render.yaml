@@ -1,15 +1,13 @@
 # Render blueprint for the FRVP live trader v2 (Rust).
 #
-# Fresh deploys: this blueprint builds the static musl binary in Docker and
-# runs it (~15MB image, <1s cold start).
+# Fresh deploys: this blueprint builds a Docker image that runs the prebuilt
+# static musl binary committed at bin/live-trader-x86_64 (~20MB image,
+# zero-compile deploys). Dockerfile.build is the compile-from-source variant.
 #
 # NOTE — the existing production service (live-trader-pxjv.onrender.com) was
-# created in 2026-09 with runtime: python, BEFORE this rewrite. Render does
-# not allow changing a service's runtime in place, so that service instead
-# runs the pre-built static binary committed at bin/live-trader-x86_64 with:
-#   buildCommand: echo "no build (prebuilt static binary in repo)"
-#   startCommand: ./bin/live-trader-x86_64
-# (keeping the original URL). Use THIS blueprint for any new service.
+# created in 2026-09 with runtime: python, BEFORE this rewrite, and was
+# switched to runtime: docker via the Update-service API
+# (serviceDetails.runtime), keeping its original URL and env vars.
 #
 # Architecture:
 #   * MARKET DATA (DATA_VENUE=bybit): XAUUSDT gold-perp klines from Bybit's

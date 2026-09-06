@@ -1,0 +1,18 @@
+# Self-contained alternative: compiles the static musl binary from source.
+# (~5-10 min builds; use when you don't want to rely on the committed binary.)
+# To use: set the service's dockerfilePath to /Dockerfile.build
+FROM rust:1.88-slim AS build
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY rust/Cargo.toml rust/Cargo.lock ./
+COPY rust/src ./src
+COPY rust/dashboard ./dashboard
+RUN cargo build --release --target x86_64-unknown-linux-musl
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=build /app/target/x86_64-unknown-linux-musl/release/live-trader /usr/local/bin/live-trader
+ENV HOST=0.0.0.0
+EXPOSE 10000
+USER 10001
+CMD ["live-trader"]

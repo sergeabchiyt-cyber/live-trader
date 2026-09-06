@@ -81,12 +81,15 @@ Legacy: `SYMBOL`, `DATA_VENUE` (bybit|spot|futures), `VENUE`, `MODE`,
 
 ## Deployment (Render)
 
-* **Fresh service:** use `render.yaml` (Docker build, ~15MB image).
-* **The existing service** (`live-trader-pxjv.onrender.com`, created with
-  runtime: python — runtime is immutable on Render): runs the committed static
-  binary directly:
-  * buildCommand: `echo "no build (prebuilt static binary in repo)"`
-  * startCommand: `./bin/live-trader-x86_64`
+* **Fresh service:** use `render.yaml` (Docker build, ~20MB image).
+* **The existing service** (`live-trader-pxjv.onrender.com`) was switched from
+  runtime `python` to runtime `docker` via the Update-service API (runtime is
+  patchable through `serviceDetails.runtime` since 2024-05). The Dockerfile
+  runs the **pre-built static musl binary** committed at
+  `bin/live-trader-x86_64`, so deploys are zero-compile and deterministic
+  (the service uses Render's no-cache build profile, so source builds would
+  recompile ~5-10 min on every deploy). `Dockerfile.build` is the
+  self-contained compile-from-source alternative.
 * Rebuild the committed binary after code changes:
   ```bash
   cd rust && cargo build --release --target x86_64-unknown-linux-musl
