@@ -569,6 +569,14 @@ function setTxt(id, txt, cls) {
 function renderAll() {
   const st = S.st;
   if (!st) return;
+  // topbar price from state until the first live tick arrives
+  if (!S.tick && st.last_price != null) {
+    $("px").textContent = fmt(st.last_price);
+    if (st.open0) {
+      const d0 = (st.last_price / st.open0 - 1) * 100;
+      setTxt("pxd", fmtSign(d0, 3) + "% sess", d0 >= 0 ? "up" : "dn");
+    }
+  }
   setTxt("sym", st.symbol || "—");
   // mode badges
   const mode = (st.mode || "paper").toUpperCase();
