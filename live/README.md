@@ -145,8 +145,12 @@ round-trip cost tolerance; PAXG spreads are small but not free).
   (48-bin 4H FRVP — the trade trigger), position entry/SL/TP markers
 - Prior-session profile mini-panel with engine-PoC comparison · trade log ·
   equity curve · live event log · broker/order status · config panel
-- Data endpoints: `/` (app), `/api/state` (JSON), `/api/snapshot` (JSON),
-  `/api/events` (SSE push)
+- Data endpoints: `/` (app), `/api/state` (JSON snapshot), `/api/snapshot`
+  (JSON), `/api/events` (SSE push, legacy) and **`/api/ws`** — a stdlib-only
+  RFC 6455 WebSocket that pushes state snapshots (every `POLL_S`), strategy
+  events (instantly) and ~1s price `tick`s over one connection. The dashboard
+  uses it as primary transport (auto-reconnect with backoff) with the REST
+  poll as a 15s fallback.
 
 **TV profile methodology** (per TradingView's "Volume profile indicators: basic
 concepts"): fixed row count over the session hi–lo; each bar's volume is

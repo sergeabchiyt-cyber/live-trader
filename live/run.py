@@ -90,6 +90,22 @@ def main():
     print(f"[*] dashboard -> http://{cfg.host}:{cfg.port}/   ({mode_label})")
     print("[*] ctrl-c to stop. All fills are paper unless MODE=testnet/live & dry-run=0.\n")
 
+    # ---- fast tick publisher: ~1s last-price push over WS/SSE -------------
+    # (state snapshots stay on POLL_S; strategy events are pushed on emit.)
+    def _tick_loop():
+        while True:
+            time.sleep(1.0)
+            try:
+                if hasattr(feed, "poll_ticker"):      # BybitFeed / BinanceFeed
+                    feed.poll_ticker()                # cheap ticker-only fetch
+                # Binance WS feeds: last_price is already live from the stream.
+                if feed.last_price is not None:
+                    server.hub.publish("tick", dict(price=feed.last_price,
+                                                    ts=time.time()))
+            except Exception:
+                pass
+    threading.Thread(target=_tick_loop, daemon=True, name="tick-pub").start()
+
     last_state_ts = 0
     try:
         while True:

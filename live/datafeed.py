@@ -140,6 +140,13 @@ class BinanceFeed:
             pass
         return newb, self.last_price
 
+    def poll_ticker(self):
+        """Cheap last-price refresh only (used by the ~1s dashboard tick pub)."""
+        try:
+            self.last_price = float(_get_json(self.ticker_url)["price"])
+        except Exception:
+            pass
+
 
 class BinanceWSFeed:
     """PUSH market-data feed over the public Binance WebSocket.
@@ -432,6 +439,13 @@ class BybitFeed:
         except Exception:
             pass
         return newb, self.last_price
+
+    def poll_ticker(self):
+        """Cheap last-price refresh only (used by the ~1s dashboard tick pub)."""
+        try:
+            self._ticker()
+        except Exception:
+            pass
 
 
 class ReplayFeed:

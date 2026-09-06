@@ -95,6 +95,7 @@ td{padding:4px 6px;border-bottom:1px solid #1a2336;text-align:left;white-space:n
       <span><span class="sw dash" style="border-color:#8ea0bd"></span>VAH / VAL</span>
       <span><span class="sw" style="border-color:var(--green)"></span>up vol</span>
       <span><span class="sw" style="border-color:var(--red)"></span>down vol</span>
+      <span><span class="sw dot" style="border-color:var(--tx)"></span>live price (1s WS ticks)</span>
       <span>bright rows = value area</span>
     </div>
   </div>
@@ -230,6 +231,7 @@ function drawChart(){
   const cw=W-padR-padL,ch=H-padT-padB;
   let lo=Infinity,hi=-Infinity;
   bars.forEach(b=>{if(b.l<lo)lo=b.l;if(b.h>hi)hi=b.h;});
+  if(S.tick!=null){if(S.tick<lo)lo=S.tick;if(S.tick>hi)hi=S.tick;}
   if(S.tv){if(S.tv.lo<lo)lo=S.tv.lo;if(S.tv.hi>hi)hi=S.tv.hi;}
   if(S.prof&&S.prof.hi>0){if(S.prof.lo<lo)lo=S.prof.lo;if(S.prof.hi>hi)hi=S.prof.hi;}
   if(S.pos){for(const p of[S.pos.entry,S.pos.sl,S.pos.tp]){if(p<lo)lo=p;if(p>hi)hi=p;}}
@@ -290,6 +292,11 @@ function drawChart(){
     s+=`<line x1="${x}" y1="${Y(b.h)}" x2="${x}" y2="${Y(b.l)}" stroke="${col}" stroke-width="1"/>`;
     const yO=Y(b.o),yC=Y(b.c);
     s+=`<rect x="${x-w/2}" y="${Math.min(yO,yC)}" width="${w}" height="${Math.max(1,Math.abs(yO-yC))}" fill="${col}" opacity="0.92"/>`;});
+  // ---- live price (1s WS ticks) ----
+  if(S.tick!=null){
+    const yt=Y(S.tick);
+    s+=`<line x1="${padL}" y1="${yt}" x2="${W-padR}" y2="${yt}" stroke="#e9edf5" stroke-width="0.9" stroke-dasharray="1 3" opacity="0.6"/>`+
+       `<text x="${W-padR-4}" y="${yt+11}" fill="#e9edf5" font-size="9.5" text-anchor="end">${fmt(S.tick,1)}</text>`;}
   // ---- engine PoC (trade trigger) ----
   if(S.prof&&S.prof.poc){
     const ye=Y(S.prof.poc);
@@ -388,7 +395,8 @@ function kpi(s){
       `<div>SL ${fmt(p.sl)} (orig ${fmt(p.sl0)}) · TP ${fmt(p.tp)}</div>`+
       `<div>stop ${(p.slp*100).toFixed(3)}% · RR ${p.rr}</div>`+
       `<div>run extreme ${fmt(p.runx)} · trail ${fmt(p.trail_a,2)}R</div>`+
-      `<div>unrealized ${p.unreal_pct==null?'–':(p.unreal_pct>=0?'<span class="win">':'<span class="lose">')+p.unreal_pct.toFixed(3)+'%</span>'}</div>`;
+      `<div>unrealized <span id="pos_unreal">${p.unreal_pct==null?'–':(p.unreal_pct>=0?'+':'')+p.unreal_pct.toFixed(3)+'%'}</span>`+
+      `<span class="mut"> · live @ ${S.tick!=null?fmt(S.tick):'–'}</span></div>`;
   }else if(s.phase==='waiting_trigger'){
     el.innerHTML='<div class="mut">flat — session traded: no</div>'+
       (s.prev_poc!=null?`<div>waiting first-touch of <span style="color:var(--blue)">engine PoC ${fmt(s.prev_poc)}</span> (${s.bias>0?'long pullback':'short rally'} bias)</div>`:'')+
@@ -439,21 +447,41 @@ function refreshState(s){
   applyState(s);kpi(s);rerender();
   $('vpnote').textContent=S.tv?`prior session · ${S.rows} rows · VA ${S.vaPct}%`:'';
 }
+function onTick(d){
+  if(!d||d.price==null)return;
+  S.tick=d.price;
+  $('k_price').textContent=fmt(d.price);
+  if(S.pos){                        // live unrealized on the position panel
+    const u=S.pos.side==='long'?(d.price/S.pos.entry-1)*100:(1-d.price/S.pos.entry)*100;
+    const el=$('pos_unreal');
+    if(el){el.className=u>=0?'win':'lose';el.textContent=(u>=0?'+':'')+u.toFixed(3)+'%';}
+  }
+  drawChart();
+  $('statusline').textContent=`live · tick ${new Date((d.ts||Date.now()/1000)*1000).toISOString().slice(11,19)}Z · ${fmt(d.price)}${window.wsLive?' · WS push':' · polling'}`;
+}
 async function refresh(){
   try{
     const r=await fetch('/api/state');const s=await r.json();
-    $('statusline').textContent=`connected · snapshot ${new Date().toISOString().slice(11,19)}Z · bars ${s.total_bars||S.bars.length} · trades ${(s.last_trades||[]).length}${window.sse?' · SSE live':' · polling'}`;
+    $('statusline').textContent=`connected · snapshot ${new Date().toISOString().slice(11,19)}Z · bars ${s.total_bars||S.bars.length} · trades ${(s.last_trades||[]).length}${window.wsLive?' · WS push':' · polling (fallback)'}`;
     refreshState(s);
   }catch(e){$('statusline').textContent='offline — server not reachable (open via the running server URL)';}
 }
-function connectSSE(){
+/* ---- WebSocket push: one connection for state + events + 1s ticks.
+ * Falls back to the 15s REST poll when WS is unavailable; reconnects with
+ * backoff. Message shape == SSE: {type, ts, data}. ---- */
+let wsRetryMs=1000;
+function connectWS(){
   try{
-    const es=new EventSource('/api/events');
-    es.onmessage=e=>{try{const ev=JSON.parse(e.data);
-      if(ev.type==='state')refreshState(ev.data);else addEvent(ev);}catch(err){}};
-    es.onopen=()=>{window.sse=true;};
-    es.onerror=()=>{window.sse=false;};
-  }catch(e){window.sse=false;}
+    const proto=location.protocol==='https:'?'wss':'ws';
+    const ws=new WebSocket(`${proto}://${location.host}/api/ws`);
+    ws.onopen=()=>{window.wsLive=true;wsRetryMs=1000;};
+    ws.onmessage=e=>{try{const ev=JSON.parse(e.data);
+      if(ev.type==='state')refreshState(ev.data);
+      else if(ev.type==='tick')onTick(ev.data);
+      else addEvent(ev);}catch(err){}};
+    ws.onclose=()=>{window.wsLive=false;setTimeout(connectWS,wsRetryMs);wsRetryMs=Math.min(wsRetryMs*2,15000);};
+    ws.onerror=()=>{try{ws.close();}catch(_){}};   // triggers onclose -> retry
+  }catch(e){window.wsLive=false;}
 }
 // toolbar
 $('sel_rows').addEventListener('change',e=>{S.rows=+e.target.value;try{localStorage.tvRows=S.rows;}catch(_){}refresh();});
@@ -464,7 +492,7 @@ try{
   if(localStorage.tvVa){S.vaPct=+localStorage.tvVa;$('sel_va').value=S.vaPct;}
 }catch(_){}
 window.addEventListener('resize',rerender);
-refresh();setInterval(refresh,5000);connectSSE();
+refresh();setInterval(refresh,15000);connectWS();
 </script>
 </body></html>
 """
